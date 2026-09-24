@@ -154,6 +154,17 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 1 if any(i.level == "error" for i in summary.issues) else 0
 
 
+def cmd_gui(_args: argparse.Namespace) -> int:
+    from . import gui as gui_module
+
+    try:
+        gui_module.run()
+    except gui_module.GuiError as exc:
+        print(f"ОШИБКА: {exc}")
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autoedit",
@@ -191,6 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
     )
     render_parser.set_defaults(func=cmd_render)
+
+    gui_parser = subparsers.add_parser("gui", help="Открыть простое графическое окно (необязательно)")
+    gui_parser.set_defaults(func=cmd_gui)
 
     return parser
 

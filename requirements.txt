@@ -9,3 +9,4 @@
 # офлайн.
 faster-whisper>=1.0
 opentimelineio>=0.16
+otio-fcpx-xml-adapter>=1.0

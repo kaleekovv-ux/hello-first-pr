@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import align, audio, report, video
+from . import align, audio, export, report, video
 from .plan import ValidationIssue
 
 FPS = 30
@@ -266,6 +266,14 @@ def render_project(
 
     _progress(progress, "Свожу видео и звук вместе...")
     _mux(assembled_path, audio_path, summary.output_path, mode)
+
+    if not mode.no_fx:
+        _progress(progress, "Экспортирую таймлайн для DaVinci Resolve...")
+        try:
+            export.export_timeline(plan.get("title", "AutoEdit"), timeline, project_dir, output_dir / "timeline.otio", FPS)
+            export.export_timeline(plan.get("title", "AutoEdit"), timeline, project_dir, output_dir / "timeline.fcpxml", FPS)
+        except export.ExportError as exc:
+            summary.warnings.append(f"экспорт таймлайна пропущен: {exc}")
 
     report.write_render_report(
         output_dir / "report.txt", plan, timeline, summary.issues, summary.warnings,
