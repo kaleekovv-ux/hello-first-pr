@@ -243,23 +243,37 @@ def resolve_anchor_starts(
     issues: list[ValidationIssue] = []
     starts: dict[str, float] = {}
     search_index = 0
+    last_matched_id: str | None = None
 
     for shot in shots:
         anchor = shot.get("anchor")
         if not anchor:
             continue
         shot_id = shot.get("id", "?")
-        match, search_index = find_anchor(words, anchor, search_index)
+        match, next_index = find_anchor(words, anchor, search_index)
         if match is None:
+            # Поиск anchor-ов идёт строго по порядку (вперёд от места, где
+            # нашёлся предыдущий anchor) — если этот anchor не нашёлся, это
+            # часто значит, что ПРЕДЫДУЩИЙ anchor совпал не в том месте
+            # (слишком рано или слишком поздно) и поиск текущего начался не
+            # оттуда. Показываем, с какой секунды шёл поиск, и какой anchor
+            # был найден последним — чтобы было видно, где искать причину.
+            position_time = words[search_index].start if search_index < len(words) else (words[-1].end if words else 0.0)
+            hint = f" Последним успешно нашёлся anchor кадра {last_matched_id} — проверьте, не там ли причина." if last_matched_id else ""
             issues.append(
                 ValidationIssue(
                     "error",
                     shot_id,
-                    f'слова "{anchor}" не найдены в озвучке (или встречаются не по порядку)',
+                    f'слова "{anchor}" не найдены в озвучке начиная примерно с {position_time:.1f} сек '
+                    f"(поиск идёт строго по порядку от этой точки — если фраза на самом деле звучит раньше, "
+                    f"значит, предыдущий anchor совпал не в том месте).{hint} Посмотрите output/subtitles.srt "
+                    f"рядом с этим временем — что там реально распознано.",
                 )
             )
             continue
         starts[shot_id] = match.start
+        search_index = next_index
+        last_matched_id = shot_id
 
     return starts, issues
 

@@ -13,6 +13,7 @@ from autoedit.align import (
     find_anchor,
     generate_srt,
     load_or_transcribe,
+    resolve_anchor_starts,
 )
 
 
@@ -178,6 +179,28 @@ class GenerateSrtTests(unittest.TestCase):
                 if "-->" in line or line.strip().isdigit() or not line.strip():
                     continue
                 self.assertLessEqual(len(line), 42)
+
+
+class ResolveAnchorStartsTests(unittest.TestCase):
+    def test_missing_anchor_error_reports_search_position_and_previous_shot(self) -> None:
+        shots = [
+            {"id": "H01", "anchor": "Imagine leaving home"},
+            {"id": "H02", "anchor": "this phrase is not in the audio"},
+        ]
+        _starts, issues = resolve_anchor_starts(shots, SAMPLE_WORDS)
+        self.assertEqual(len(issues), 1)
+        message = issues[0].message
+        # Сообщение должно содержать время, с которого продолжился поиск
+        # после H01, и упоминать, что последним успешно нашёлся именно
+        # H01, чтобы было ясно, где искать причину несовпадения.
+        self.assertIn("сек", message)
+        self.assertIn("H01", message)
+
+    def test_first_anchor_missing_has_no_previous_shot_hint(self) -> None:
+        shots = [{"id": "H01", "anchor": "not present at all"}]
+        _starts, issues = resolve_anchor_starts(shots, SAMPLE_WORDS)
+        self.assertEqual(len(issues), 1)
+        self.assertNotIn("Последним успешно нашёлся", issues[0].message)
 
 
 class EnforceMinDurationTests(unittest.TestCase):
