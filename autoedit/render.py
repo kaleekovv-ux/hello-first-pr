@@ -242,6 +242,10 @@ def render_project(
     summary.total_screen_time = sum(t.duration for t in timeline)
     summary.ai_screen_time = sum(t.duration for t in timeline if t.shot.get("is_ai"))
 
+    if not mode.audio_only:
+        _progress(progress, "Проверяю качество исходников...")
+        summary.warnings.extend(video.check_source_quality(timeline, project_dir, mode.width, mode.height))
+
     music_cues, music_issues = _resolve_music_cues(plan, words, project_dir)
     summary.issues.extend(music_issues)
     sfx_cues = _resolve_sfx_cues(timeline, project_dir)

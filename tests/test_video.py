@@ -1,9 +1,11 @@
 import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from autoedit import video
+from autoedit.align import TimedShot
 
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
@@ -168,6 +170,57 @@ class HasVideoStreamTests(unittest.TestCase):
             self.assertTrue(video.has_video_stream(clip))
 
 
+class ResolveFitModeTests(unittest.TestCase):
+    def test_explicit_fit_wins(self) -> None:
+        self.assertEqual(video.resolve_fit_mode({"fit": "contain"}, (1920, 1080), 1920, 1080), "contain")
+
+    def test_matching_orientation_defaults_to_cover(self) -> None:
+        self.assertEqual(video.resolve_fit_mode({}, (1920, 1080), 1920, 1080), "cover")
+        self.assertEqual(video.resolve_fit_mode({}, (1080, 1920), 1080, 1920), "cover")
+
+    def test_mismatched_orientation_defaults_to_blur_fill(self) -> None:
+        self.assertEqual(video.resolve_fit_mode({}, (1080, 1920), 1920, 1080), "blur_fill")
+        self.assertEqual(video.resolve_fit_mode({}, (1920, 1080), 1080, 1920), "blur_fill")
+
+    def test_unknown_dimensions_defaults_to_cover(self) -> None:
+        self.assertEqual(video.resolve_fit_mode({}, None, 1920, 1080), "cover")
+
+
+@unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg не установлен в этом окружении")
+class FitModeRenderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.project_dir = Path(self._tmp.name)
+        self.asset = self.project_dir / "vertical.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=red:size=608x1080:rate=30:duration=3",
+                "-pix_fmt", "yuv420p", str(self.asset),
+            ],
+            check=True,
+        )
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_vertical_source_in_horizontal_project_auto_blur_fill(self) -> None:
+        shot = {"id": "V1", "asset": "vertical.mp4", "motion": "static"}
+        out_path = self.project_dir / "out.mp4"
+        result = video.render_shot(shot, 2.0, self.project_dir, out_path, width=640, height=360, fps=30)
+        self.assertTrue(out_path.is_file())
+        self.assertEqual(video.probe_dimensions(out_path), (640, 360))
+        self.assertEqual(result.warnings, [])
+
+    def test_explicit_contain_letterboxes(self) -> None:
+        shot = {"id": "V2", "asset": "vertical.mp4", "motion": "static", "fit": "contain"}
+        out_path = self.project_dir / "out.mp4"
+        result = video.render_shot(shot, 2.0, self.project_dir, out_path, width=640, height=360, fps=30)
+        self.assertTrue(out_path.is_file())
+        self.assertEqual(video.probe_dimensions(out_path), (640, 360))
+        self.assertEqual(result.warnings, [])
+
+
 class BuildTextFiltersTests(unittest.TestCase):
     def test_bundled_font_is_found(self) -> None:
         self.assertTrue(video.BUNDLED_FONT.is_file())
@@ -203,6 +256,66 @@ class BuildTextFiltersTests(unittest.TestCase):
     def test_fade_in_out_alpha_expression_present(self) -> None:
         filters, _warn = video.build_text_filters("HI", None, 1920, 1080, 3.0)
         self.assertIn(f"alpha='if(lt(t,{video.TEXT_FADE_IN})", filters[0])
+
+
+@unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg не установлен в этом окружении")
+class CheckSourceQualityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.project_dir = Path(self._tmp.name)
+
+        def make(name: str, color: str, size: str, duration: float, fps: int = 30) -> None:
+            path = self.project_dir / name
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", f"color=c={color}:s={size}:rate={fps}:d={duration}",
+                    "-pix_fmt", "yuv420p", str(path),
+                ],
+                check=True,
+            )
+
+        make("dark.mp4", "black", "1920x1080", 3)
+        make("bright.mp4", "white", "1920x1080", 3)
+        make("small.mp4", "gray", "640x360", 3)
+        make("fps24.mp4", "gray", "1920x1080", 3, fps=24)
+        make("normal.mp4", "gray", "1920x1080", 20)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_flags_underexposed_source(self) -> None:
+        timeline = [TimedShot(shot={"id": "S1", "asset": "dark.mp4"}, start=0.0, duration=2.0)]
+        warnings = video.check_source_quality(timeline, self.project_dir, 1920, 1080)
+        self.assertTrue(any("слишком тёмным" in w for w in warnings))
+
+    def test_flags_overexposed_source(self) -> None:
+        timeline = [TimedShot(shot={"id": "S1", "asset": "bright.mp4"}, start=0.0, duration=2.0)]
+        warnings = video.check_source_quality(timeline, self.project_dir, 1920, 1080)
+        self.assertTrue(any("пересвеченным" in w for w in warnings))
+
+    def test_flags_low_resolution_source(self) -> None:
+        timeline = [TimedShot(shot={"id": "S1", "asset": "small.mp4"}, start=0.0, duration=2.0)]
+        warnings = video.check_source_quality(timeline, self.project_dir, 1920, 1080)
+        self.assertTrue(any("меньше 1080p" in w for w in warnings))
+
+    def test_flags_non_30fps_source(self) -> None:
+        timeline = [TimedShot(shot={"id": "S1", "asset": "fps24.mp4"}, start=0.0, duration=2.0)]
+        warnings = video.check_source_quality(timeline, self.project_dir, 1920, 1080)
+        self.assertTrue(any("24" in w and "к/с" in w for w in warnings))
+
+    def test_flags_same_source_over_12_seconds_in_a_row(self) -> None:
+        timeline = [
+            TimedShot(shot={"id": "S1", "asset": "normal.mp4"}, start=0.0, duration=7.0),
+            TimedShot(shot={"id": "S2", "asset": "normal.mp4"}, start=7.0, duration=7.0),
+        ]
+        warnings = video.check_source_quality(timeline, self.project_dir, 1920, 1080)
+        self.assertTrue(any("подряд" in w and "14.0" in w for w in warnings))
+
+    def test_no_warnings_for_clean_short_normal_source(self) -> None:
+        timeline = [TimedShot(shot={"id": "S1", "asset": "normal.mp4"}, start=0.0, duration=5.0)]
+        warnings = video.check_source_quality(timeline, self.project_dir, 1920, 1080)
+        self.assertEqual(warnings, [])
 
 
 if __name__ == "__main__":

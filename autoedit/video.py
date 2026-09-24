@@ -66,6 +66,29 @@ def probe_duration(path: Path) -> float | None:
         return None
 
 
+def probe_dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parts = result.stdout.strip().split(",")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
 def has_video_stream(path: Path) -> bool:
     """Проверяет, что в файле реально есть видеопоток (не пустой/битый файл)."""
     try:
@@ -82,6 +105,51 @@ def has_video_stream(path: Path) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return bool(result.stdout.strip())
+
+
+def probe_fps(path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate",
+                "-of", "csv=p=0",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = result.stdout.strip()
+    if "/" not in text:
+        return None
+    num, _, den = text.partition("/")
+    try:
+        den_value = float(den)
+        return float(num) / den_value if den_value else None
+    except ValueError:
+        return None
+
+
+def sample_mean_brightness(path: Path, at_time: float) -> float | None:
+    """Средняя яркость (0-255) одного кадра примерно в середине
+    используемого отрезка исходника — грубая, но дешёвая проверка на
+    пересвет/недосвет."""
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{max(at_time, 0.0):.3f}", "-i", str(path),
+        "-frames:v", "1", "-vf", "scale=64:36,format=gray",
+        "-f", "rawvideo", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    data = result.stdout
+    if not data:
+        return None
+    return sum(data) / len(data)
 
 
 BUNDLED_FONT = Path(__file__).parent / "assets" / "fonts" / "Oswald-Bold.ttf"
@@ -407,6 +475,125 @@ def build_look_filters(look: dict[str, Any] | None) -> list[str]:
     return filters
 
 
+FIT_MODES = {"cover", "contain", "blur_fill"}
+
+
+def resolve_fit_mode(shot: dict[str, Any], source_dims: tuple[int, int] | None, width: int, height: int) -> str:
+    """Определяет, как вписывать исходник в кадр нужного размера.
+
+    Явное поле "fit" в кадре всегда побеждает. Иначе, если ориентация
+    исходника не совпадает с ориентацией ролика (например, вертикальное
+    видео в горизонтальном ролике), по умолчанию используется
+    "blur_fill" (размытая подложка + чёткая картинка по центру) вместо
+    обычной обрезки по краям, которая в этом случае съедала бы почти
+    всё изображение.
+    """
+    explicit = shot.get("fit")
+    if explicit in FIT_MODES:
+        return explicit
+    if source_dims:
+        source_w, source_h = source_dims
+        if source_w > 0 and source_h > 0:
+            source_vertical = source_h > source_w
+            target_vertical = height > width
+            if source_vertical != target_vertical:
+                return "blur_fill"
+    return "cover"
+
+
+def _blur_fill_complex(input_label: str, width: int, height: int, output_label: str) -> str:
+    return (
+        f"[{input_label}]split=2[bg_src][fg_src];"
+        f"[bg_src]scale=w={width}:h={height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},gblur=sigma=25,eq=brightness=-0.08[bg];"
+        f"[fg_src]scale=w={width}:h={height}:force_original_aspect_ratio=decrease,setsar=1[fg];"
+        f"[bg][fg]overlay=x=(W-w)/2:y=(H-h)/2[{output_label}]"
+    )
+
+
+BRIGHTNESS_OVEREXPOSED = 235.0
+BRIGHTNESS_UNDEREXPOSED = 20.0
+MIN_SOURCE_HEIGHT = 1080
+SAME_SOURCE_MAX_SECONDS = 12.0
+
+
+def check_source_quality(
+    timeline: list[Any], project_dir: Path, target_width: int, target_height: int
+) -> list[str]:
+    """Проверяет исходники кадров на типичные проблемы: пересвет/недосвет,
+    слишком долгий показ одного и того же исходника подряд, вертикальный
+    исходник в горизонтальном ролике (и наоборот), низкое разрешение,
+    нестандартную частоту кадров. timeline — список TimedShot из align.py
+    (не импортируем сам класс, чтобы не плодить циклические импорты).
+    Возвращает список готовых строк-предупреждений на русском.
+    """
+    warnings: list[str] = []
+    dims_cache: dict[str, tuple[int, int] | None] = {}
+
+    for timed in timeline:
+        shot = timed.shot
+        shot_id = shot.get("id", "?")
+        asset_rel = shot.get("asset")
+        if not asset_rel:
+            continue
+        asset_path = project_dir / asset_rel
+        if not asset_path.is_file() or asset_path.suffix.lower() in IMAGE_SUFFIXES:
+            continue
+
+        dims = dims_cache.setdefault(asset_rel, probe_dimensions(asset_path))
+        if dims:
+            src_w, src_h = dims
+            if min(src_w, src_h) < MIN_SOURCE_HEIGHT:
+                warnings.append(
+                    f"Кадр {shot_id}: исходник {asset_rel} — {src_w}x{src_h}, меньше 1080p, "
+                    f"в кадре может быть заметно мыльным"
+                )
+            src_vertical = src_h > src_w
+            target_vertical = target_height > target_width
+            if src_vertical != target_vertical and (shot.get("fit") or "auto") == "auto":
+                warnings.append(
+                    f"Кадр {shot_id}: исходник {asset_rel} — {'вертикальный' if src_vertical else 'горизонтальный'}, "
+                    f"а ролик {'вертикальный' if target_vertical else 'горизонтальный'} "
+                    f"(вписан через blur_fill автоматически; переопределите полем \"fit\", если нужно иначе)"
+                )
+
+        fps = probe_fps(asset_path)
+        if fps and abs(fps - 30) > 0.5:
+            warnings.append(
+                f"Кадр {shot_id}: исходник {asset_rel} снят с частотой {fps:.2f} к/с — "
+                f"при приведении к 30 к/с возможны небольшие рывки в движении"
+            )
+
+        source_start = float(shot.get("source_start", 0.0) or 0.0)
+        mid_time = source_start + timed.duration / 2
+        brightness = sample_mean_brightness(asset_path, mid_time)
+        if brightness is not None:
+            if brightness >= BRIGHTNESS_OVEREXPOSED:
+                warnings.append(f"Кадр {shot_id}: исходник {asset_rel} выглядит пересвеченным (почти белый кадр)")
+            elif brightness <= BRIGHTNESS_UNDEREXPOSED:
+                warnings.append(f"Кадр {shot_id}: исходник {asset_rel} выглядит слишком тёмным (почти чёрный кадр)")
+
+    # Один и тот же исходник подряд дольше SAME_SOURCE_MAX_SECONDS
+    run_asset: str | None = None
+    run_seconds = 0.0
+    run_start_id = None
+    for timed in [*timeline, None]:
+        asset_rel = timed.shot.get("asset") if timed else None
+        if asset_rel == run_asset and timed is not None:
+            run_seconds += timed.duration
+        else:
+            if run_asset and run_seconds > SAME_SOURCE_MAX_SECONDS:
+                warnings.append(
+                    f'Один и тот же исходник "{run_asset}" показан подряд {run_seconds:.1f} сек '
+                    f"(начиная с кадра {run_start_id}) — может выглядеть однообразно"
+                )
+            run_asset = asset_rel
+            run_seconds = timed.duration if timed else 0.0
+            run_start_id = timed.shot.get("id", "?") if timed else None
+
+    return warnings
+
+
 def render_shot(
     shot: dict[str, Any],
     duration: float,
@@ -443,11 +630,21 @@ def render_shot(
 
     motion_span = duration - freeze_extra
 
+    source_dims = probe_dimensions(asset_path)
+    fit_mode = resolve_fit_mode(shot, source_dims, width, height)
+    use_blur_fill = fit_mode == "blur_fill"
+
     filters: list[str] = []
     crop = shot.get("crop")
     if crop:
         cx, cy, cw, ch = crop
         filters.append(f"crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cx}:y=ih*{cy}")
+
+    if fit_mode == "contain":
+        filters.append(
+            f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+        )
 
     if speed != 1.0:
         filters.append(f"setpts=PTS/{speed}")
@@ -484,7 +681,7 @@ def render_shot(
     overlays = shot.get("overlays") or []
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not overlays:
+    if not overlays and not use_blur_fill:
         args = [
             *input_args,
             "-vf", filter_chain,
@@ -496,7 +693,10 @@ def render_shot(
         return ShotRenderResult(path=out_path, warnings=warnings)
 
     args = list(input_args)
-    filter_parts = [f"[0:v]{filter_chain}[base0]"]
+    if use_blur_fill:
+        filter_parts = [_blur_fill_complex("0:v", width, height, "fitted0"), f"[fitted0]{filter_chain}[base0]"]
+    else:
+        filter_parts = [f"[0:v]{filter_chain}[base0]"]
     last_label = "base0"
     for i, overlay in enumerate(overlays, start=1):
         overlay_path = project_dir / overlay["asset"]
