@@ -12,6 +12,7 @@ from . import env as env_module
 from . import plan as plan_module
 from . import render as render_module
 from . import report as report_module
+from . import sheet as sheet_module
 
 
 def _print_env_status(status: env_module.EnvStatus) -> None:
@@ -52,7 +53,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         except align_module.AlignError as exc:
             issues.append(plan_module.ValidationIssue("warning", None, f"привязка к озвучке пропущена: {exc}"))
         else:
-            _timeline, align_issues = align_module.build_timeline(data, words)
+            _timeline, align_issues = align_module.build_timeline(data, words, args.allow_reorder)
             issues.extend(align_issues)
             align_module.generate_srt(words, output_dir / "subtitles.srt")
             print(f"Субтитры сохранены: {output_dir / 'subtitles.srt'}")
@@ -138,7 +139,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         print(f"  {message}")
 
     try:
-        summary = render_module.render_project(project_dir, data, mode, args.model, progress)
+        summary = render_module.render_project(project_dir, data, mode, args.model, progress, args.allow_reorder)
     except render_module.RenderError as exc:
         print(f"ОШИБКА: {exc}")
         return 1
@@ -168,6 +169,28 @@ def cmd_gui(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sheet(args: argparse.Namespace) -> int:
+    folder = Path(args.folder).resolve()
+    out_dir = Path(args.out).resolve() if args.out else folder / "output"
+
+    status = env_module.check_environment()
+    if not status.ffmpeg_ok:
+        print("Не могу построить лист миниатюр: не найден FFmpeg.")
+        print(env_module.ffmpeg_install_hint())
+        return 1
+
+    try:
+        sheets = sheet_module.generate_contact_sheets(folder, out_dir)
+    except sheet_module.SheetError as exc:
+        print(f"ОШИБКА: {exc}")
+        return 1
+
+    print(f"Готово: {len(sheets)} лист(а/ов) миниатюр")
+    for p in sheets:
+        print(f"  {p}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autoedit",
@@ -181,6 +204,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default=align_module.DEFAULT_MODEL_SIZE,
         help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
+    )
+    check_parser.add_argument(
+        "--allow-reorder",
+        action="store_true",
+        help="Не считать ошибкой, если порядок кадров в плане не совпадает с порядком в озвучке (только предупреждение)",
     )
     check_parser.set_defaults(func=cmd_check)
 
@@ -206,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument("--check-no-sound", action="store_true", help="Без звука — понятно ли по картинке")
     render_parser.add_argument("--check-audio-only", action="store_true", help="Только звук — держится ли история на голосе и звуке")
     render_parser.add_argument(
+        "--allow-reorder",
+        action="store_true",
+        help="Не останавливаться, если порядок кадров в плане не совпадает с порядком в озвучке (только предупреждение)",
+    )
+    render_parser.add_argument(
         "--model",
         default=align_module.DEFAULT_MODEL_SIZE,
         help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
@@ -214,6 +247,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     gui_parser = subparsers.add_parser("gui", help="Открыть простое графическое окно (необязательно)")
     gui_parser.set_defaults(func=cmd_gui)
+
+    sheet_parser = subparsers.add_parser("sheet", help="Собрать лист миниатюр по видео в папке")
+    sheet_parser.add_argument("folder", help="Папка с видеофайлами (ищет и во вложенных папках)")
+    sheet_parser.add_argument("--out", help="Куда сохранить contact_sheet.jpg (по умолчанию <папка>/output)")
+    sheet_parser.set_defaults(func=cmd_sheet)
 
     return parser
 

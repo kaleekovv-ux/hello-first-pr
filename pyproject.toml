@@ -9,6 +9,7 @@ description = "Черновой автомонтаж документальны�
 requires-python = ">=3.11"
 dependencies = [
     "faster-whisper>=1.0",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
@@ -22,3 +23,6 @@ autoedit = "autoedit.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["autoedit*"]
+
+[tool.setuptools.package-data]
+autoedit = ["assets/fonts/*.ttf", "assets/fonts/*.txt"]

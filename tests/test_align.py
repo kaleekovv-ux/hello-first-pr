@@ -81,6 +81,29 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertEqual(len(timeline), 1)
         self.assertTrue(any(i.shot_id == "H05" and "не найдены" in i.message for i in issues))
 
+    def test_out_of_order_explicit_shots_report_error(self) -> None:
+        plan = {
+            "shots": [
+                {"id": "S1", "start": 10.0, "duration": 2.0},
+                {"id": "S2", "start": 2.0, "duration": 2.0},
+            ]
+        }
+        timeline, issues = build_timeline(plan, [])
+        errors = [i for i in issues if i.level == "error"]
+        self.assertTrue(any("не совпадает с порядком" in i.message for i in errors))
+        self.assertEqual([t.shot["id"] for t in timeline], ["S2", "S1"])
+
+    def test_allow_reorder_downgrades_to_warning(self) -> None:
+        plan = {
+            "shots": [
+                {"id": "S1", "start": 10.0, "duration": 2.0},
+                {"id": "S2", "start": 2.0, "duration": 2.0},
+            ]
+        }
+        timeline, issues = build_timeline(plan, [], allow_reorder=True)
+        self.assertFalse(any(i.level == "error" for i in issues))
+        self.assertTrue(any(i.level == "warning" and "не совпадает с порядком" in i.message for i in issues))
+
     def test_explicit_timing_mixed_with_anchor(self) -> None:
         plan = {
             "shots": [

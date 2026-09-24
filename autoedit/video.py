@@ -84,7 +84,10 @@ def has_video_stream(path: Path) -> bool:
     return bool(result.stdout.strip())
 
 
+BUNDLED_FONT = Path(__file__).parent / "assets" / "fonts" / "Oswald-Bold.ttf"
+
 _FONT_CANDIDATES = [
+    str(BUNDLED_FONT),
     # Linux
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -105,7 +108,173 @@ def find_bold_font() -> str | None:
 
 
 def _escape_drawtext(text: str) -> str:
-    return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\u2019")
+    return (
+        text.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\u2019")
+        .replace("%", "\\%")
+    )
+
+
+DEFAULT_TEXT_SIZE = 96
+DEFAULT_TEXT_COLOR = "#FFFFFF"
+DEFAULT_TEXT_STROKE = 6
+DEFAULT_HIGHLIGHT_COLOR = "#FFC72C"
+TEXT_FADE_IN = 0.3
+TEXT_FADE_OUT = 0.2
+TEXT_REFERENCE_WIDTH = 1920  # "size" \u0432 text_style \u043a\u0430\u043b\u0438\u0431\u0440\u043e\u0432\u0430\u043d \u043f\u043e\u0434 \u0448\u0438\u0440\u0438\u043d\u0443 1920px
+
+
+@dataclass
+class TextSegment:
+    text: str
+    highlighted: bool
+
+
+def _wrap_text_to_lines(text: str, font_path: str, font_size: int, max_width: float) -> list[str]:
+    from PIL import ImageFont
+
+    font = ImageFont.truetype(font_path, font_size)
+    words = text.split()
+    if not words:
+        return []
+
+    if font.getlength(text) <= max_width:
+        return [text]
+
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        candidate = " ".join(current + [word])
+        if current and font.getlength(candidate) > max_width:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+
+    if len(lines) <= 2:
+        return lines
+
+    # \u041d\u0435 \u043f\u043e\u043c\u0435\u0449\u0430\u0435\u0442\u0441\u044f \u0438 \u0432 2 \u0441\u0442\u0440\u043e\u043a\u0438 \u2014 \u0441\u0436\u0438\u043c\u0430\u0435\u043c \u0442\u0435\u043a\u0441\u0442 \u0434\u043e \u0434\u0432\u0443\u0445 \u0441\u0442\u0440\u043e\u043a \u043f\u0440\u0438\u043c\u0435\u0440\u043d\u043e
+    # \u043f\u043e\u0440\u043e\u0432\u043d\u0443 \u043f\u043e \u043a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u0443 \u0441\u043b\u043e\u0432 (\u043b\u0443\u0447\u0448\u0435 \u0447\u0443\u0442\u044c \u0434\u043b\u0438\u043d\u043d\u0435\u0435 \u0441\u0442\u0440\u043e\u043a\u0430, \u0447\u0435\u043c 3-\u044f \u0441\u0442\u0440\u043e\u043a\u0430).
+    midpoint = max(len(words) // 2, 1)
+    return [" ".join(words[:midpoint]), " ".join(words[midpoint:])]
+
+
+def _split_highlight(line: str, highlight: str | None) -> list[TextSegment]:
+    if not highlight:
+        return [TextSegment(line, False)]
+    idx = line.find(highlight)
+    if idx == -1:
+        idx = line.lower().find(highlight.lower())
+        if idx == -1:
+            return [TextSegment(line, False)]
+        highlight = line[idx : idx + len(highlight)]
+    segments: list[TextSegment] = []
+    if idx > 0:
+        segments.append(TextSegment(line[:idx], False))
+    segments.append(TextSegment(highlight, True))
+    rest = line[idx + len(highlight) :]
+    if rest:
+        segments.append(TextSegment(rest, False))
+    return segments
+
+
+def build_text_filters(
+    text: str,
+    text_style: dict[str, Any] | None,
+    width: int,
+    height: int,
+    duration: float,
+) -> tuple[list[str], str | None]:
+    """\u0421\u0442\u0440\u043e\u0438\u0442 drawtext-\u0444\u0438\u043b\u044c\u0442\u0440\u044b \u0434\u043b\u044f \u0442\u0435\u043a\u0441\u0442\u043e\u0432\u043e\u0439 \u043f\u043b\u0430\u0448\u043a\u0438: \u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u043d\u0430 2 \u0441\u0442\u0440\u043e\u043a\u0438,
+    \u0432\u044b\u0434\u0435\u043b\u0435\u043d\u0438\u0435 \u0447\u0430\u0441\u0442\u0438 \u0442\u0435\u043a\u0441\u0442\u0430 \u0446\u0432\u0435\u0442\u043e\u043c (highlight), \u043f\u043b\u0430\u0432\u043d\u043e\u0435 \u043f\u043e\u044f\u0432\u043b\u0435\u043d\u0438\u0435/\u0438\u0441\u0447\u0435\u0437\u0430\u043d\u0438\u0435.
+    \u0412\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 (\u0441\u043f\u0438\u0441\u043e\u043a \u0444\u0438\u043b\u044c\u0442\u0440\u043e\u0432, \u043f\u0440\u0435\u0434\u0443\u043f\u0440\u0435\u0436\u0434\u0435\u043d\u0438\u0435 \u0438\u043b\u0438 None)."""
+    from PIL import ImageFont
+
+    text_style = text_style or {}
+    font = find_bold_font()
+    if not font:
+        return [], (
+            "\u0442\u0435\u043a\u0441\u0442 \u043d\u0435 \u043d\u0430\u043b\u043e\u0436\u0435\u043d \u2014 \u043d\u0430 \u044d\u0442\u043e\u0439 \u0441\u0438\u0441\u0442\u0435\u043c\u0435 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u043d\u0438 \u0432\u0441\u0442\u0440\u043e\u0435\u043d\u043d\u044b\u0439, \u043d\u0438 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 "
+            "\u0448\u0440\u0438\u0444\u0442 \u0434\u043b\u044f drawtext"
+        )
+
+    size = max(round(int(text_style.get("size", DEFAULT_TEXT_SIZE)) * width / TEXT_REFERENCE_WIDTH), 8)
+    position = text_style.get("position", "center")
+    color = text_style.get("color", DEFAULT_TEXT_COLOR)
+    stroke = text_style.get("stroke", DEFAULT_TEXT_STROKE)
+    shadow = text_style.get("shadow", True)
+    highlight = text_style.get("highlight")
+    highlight_color = text_style.get("highlight_color", DEFAULT_HIGHLIGHT_COLOR)
+
+    max_line_width = width * 0.86
+    try:
+        pil_font = ImageFont.truetype(font, size)
+        lines = _wrap_text_to_lines(str(text), font, size, max_line_width)
+    except Exception as exc:  # noqa: BLE001 \u2014 \u043e\u0448\u0438\u0431\u043a\u0430 \u0441\u043e \u0448\u0440\u0438\u0444\u0442\u043e\u043c \u043d\u0435 \u0434\u043e\u043b\u0436\u043d\u0430 \u0440\u043e\u043d\u044f\u0442\u044c \u0432\u0435\u0441\u044c \u0440\u0435\u043d\u0434\u0435\u0440
+        return [], f"\u0442\u0435\u043a\u0441\u0442 \u043d\u0435 \u043d\u0430\u043b\u043e\u0436\u0435\u043d \u0438\u0437-\u0437\u0430 \u043e\u0448\u0438\u0431\u043a\u0438 \u0448\u0440\u0438\u0444\u0442\u0430: {exc}"
+
+    if not lines:
+        return [], None
+
+    line_height = size * 1.25
+    block_height = line_height * len(lines)
+
+    if position == "top":
+        block_top = height * 0.08
+    elif position == "bottom":
+        block_top = height * 0.82 - block_height
+    else:  # center
+        block_top = (height - block_height) / 2
+
+    fade_out_start = max(duration - TEXT_FADE_OUT, TEXT_FADE_IN)
+    alpha_expr = (
+        f"if(lt(t,{TEXT_FADE_IN}),t/{TEXT_FADE_IN},"
+        f"if(gt(t,{fade_out_start:.3f}),max(({duration:.3f}-t)/{TEXT_FADE_OUT},0),1))"
+    )
+
+    filters: list[str] = []
+    for line_index, line in enumerate(lines):
+        segments = _split_highlight(line, highlight)
+        widths = [pil_font.getlength(seg.text) for seg in segments]
+        total_width = sum(widths)
+        y = block_top + line_index * line_height
+
+        cumulative = 0.0
+        for seg, seg_width in zip(segments, widths):
+            trimmed = seg.text.strip()
+            if trimmed:
+                # FFmpeg drawtext не учитывает ширину ведущих пробелов при
+                # позиционировании текста — считаем её сами и сдвигаем x,
+                # а рисуем уже обрезанный текст, иначе соседние сегменты
+                # (например, обычный текст сразу после highlight) слипаются.
+                leading_ws = seg.text[: len(seg.text) - len(seg.text.lstrip())]
+                leading_ws_width = pil_font.getlength(leading_ws) if leading_ws else 0.0
+
+                seg_color = highlight_color if seg.highlighted else color
+                escaped = _escape_drawtext(trimmed)
+                font_escaped = font.replace("\\", "/").replace(":", "\\:")
+                parts = [
+                    f"fontfile='{font_escaped}'",
+                    f"text='{escaped}'",
+                    f"fontsize={size}",
+                    f"fontcolor={seg_color}",
+                    f"alpha='{alpha_expr}'",
+                ]
+                if stroke:
+                    parts.append(f"borderw={stroke}")
+                    parts.append("bordercolor=black")
+                if shadow:
+                    parts.extend(["shadowx=3", "shadowy=3", "shadowcolor=black@0.6"])
+                parts.append(f"x=(w-{total_width:.1f})/2+{cumulative + leading_ws_width:.1f}")
+                parts.append(f"y={y:.1f}")
+                filters.append("drawtext=" + ":".join(parts))
+            cumulative += seg_width
+
+    return filters, None
 
 
 def _ease_expr(duration: float) -> str:
@@ -211,6 +380,33 @@ def _plan_speed_and_freeze(
     return MIN_SPEED, freeze_extra, warning
 
 
+def build_look_filters(look: dict[str, Any] | None) -> list[str]:
+    """Строит фильтры общего "вида" ролика (LUT/зерно/виньетка).
+
+    Калибровка: значение 0.3 должно быть едва заметным, 1.0 — заметно,
+    но не убийственно сильным (проверено визуально на тестовых кадрах).
+    Применяется на уровне отдельного кадра, ДО текста — так виньетка не
+    затемняет текстовую плашку.
+    """
+    look = look or {}
+    filters: list[str] = []
+
+    lut = look.get("lut")
+    if lut:
+        filters.append(f"lut3d=file='{lut}'")
+
+    grain = look.get("grain") or 0
+    if grain > 0:
+        filters.append(f"noise=alls={grain * 20:.1f}:allf=t")
+
+    vignette = look.get("vignette") or 0
+    if vignette > 0:
+        angle = 0.05 + 1.25 * vignette
+        filters.append(f"vignette=angle={angle:.3f}")
+
+    return filters
+
+
 def render_shot(
     shot: dict[str, Any],
     duration: float,
@@ -219,6 +415,7 @@ def render_shot(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
+    look: dict[str, Any] | None = None,
 ) -> ShotRenderResult:
     """Рендерит один кадр (видео без звука) заданной длительности."""
     warnings: list[str] = []
@@ -265,22 +462,14 @@ def render_shot(
     if transition_in == "fade_from_black" and transition_duration > 0:
         filters.append(f"fade=t=in:st=0:d={transition_duration:.3f}:color=black")
 
+    filters.extend(build_look_filters(look))
+
     text = shot.get("text")
     if text:
-        font = find_bold_font()
-        if font:
-            escaped = _escape_drawtext(str(text))
-            filters.append(
-                "drawtext=fontfile='"
-                + font.replace("\\", "/").replace(":", "\\:")
-                + f"':text='{escaped}':fontsize=h*0.06:fontcolor=white:"
-                "borderw=3:bordercolor=black:x=(w-text_w)/2:y=h*0.82"
-            )
-        else:
-            warnings.append(
-                f'Кадр {shot.get("id", "?")}: текст не наложен — на этой системе не найден '
-                f"шрифт для drawtext (нужен .ttf-файл, например DejaVu Sans Bold)"
-            )
+        text_filters, text_warn = build_text_filters(str(text), shot.get("text_style"), width, height, duration)
+        filters.extend(text_filters)
+        if text_warn:
+            warnings.append(f'Кадр {shot.get("id", "?")}: {text_warn}')
 
     filters.append(f"fps={fps}")
     filters.append("format=yuv420p")
@@ -348,8 +537,14 @@ def render_end_screen(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
+    look: dict[str, Any] | None = None,
 ) -> None:
-    filter_chain = f"scale=w={width}:h={height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps},format=yuv420p"
+    look_filters = build_look_filters(look)
+    look_chain = ("," + ",".join(look_filters)) if look_filters else ""
+    filter_chain = (
+        f"scale=w={width}:h={height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+        f"setsar=1{look_chain},fps={fps},format=yuv420p"
+    )
     is_image = asset_path.suffix.lower() in IMAGE_SUFFIXES
     input_args = (
         ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(asset_path)]
@@ -370,7 +565,6 @@ def assemble_video(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
-    look: dict[str, Any] | None = None,
 ) -> None:
     """Склеивает уже отрендеренные кадры в один видеоряд.
 
@@ -378,6 +572,9 @@ def assemble_video(
     кадра переход не используется). Значения: ("cut"|"fade_from_black", _)
     просто конкатенируются (fade_from_black уже "вшит" в сам кадр в
     render_shot), ("crossfade", duration) — склеиваются внахлёст через xfade.
+    "Вид" (LUT/зерно/виньетка) уже применён на уровне каждого кадра в
+    render_shot/render_end_screen — так виньетка не затемняет текст,
+    который рисуется поверх неё, и здесь его применять повторно не нужно.
     """
     if not clip_paths:
         raise VideoError("Нечего собирать: список кадров пуст")
@@ -411,29 +608,11 @@ def assemble_video(
             accumulated = accumulated + durations[i]
         current_label = next_label
 
-    look = look or {}
-    look_filters: list[str] = []
-    lut = look.get("lut")
-    if lut:
-        look_filters.append(f"lut3d=file='{lut}'")
-    grain = look.get("grain") or 0
-    if grain > 0:
-        look_filters.append(f"noise=alls={grain * 40:.1f}:allf=t")
-    vignette = look.get("vignette") or 0
-    if vignette > 0:
-        look_filters.append(f"vignette=PI/{max(5 - 4 * vignette, 1.2):.2f}")
-
-    final_label = current_label
-    if look_filters:
-        look_chain = ",".join(look_filters)
-        filter_parts.append(f"[{current_label}]{look_chain}[graded]")
-        final_label = "graded"
-
     filter_complex = ";".join(filter_parts) if filter_parts else None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if filter_complex:
-        args.extend(["-filter_complex", filter_complex, "-map", f"[{final_label}]"])
+        args.extend(["-filter_complex", filter_complex, "-map", f"[{current_label}]"])
     else:
         args.extend(["-map", "0:v"])
     args.extend(["-r", str(fps), "-an", str(out_path)])

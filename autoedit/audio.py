@@ -8,6 +8,7 @@ align, отдельно от звуковой инженерии.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,7 @@ class SfxCue:
     volume: float = 1.0
 
 
-def _run_ffmpeg(args: list[str], step_name: str) -> None:
+def _run_ffmpeg(args: list[str], step_name: str) -> str:
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
@@ -48,6 +49,31 @@ def _run_ffmpeg(args: list[str], step_name: str) -> None:
     if result.returncode != 0:
         stderr_tail = "\n".join(result.stderr.strip().splitlines()[-8:])
         raise AudioError(f"FFmpeg завершился с ошибкой на шаге «{step_name}»:\n{stderr_tail}")
+    return result.stderr
+
+
+def _run_ffmpeg_loudnorm_pass(args: list[str], step_name: str) -> str:
+    """Как _run_ffmpeg, но без -loglevel error: сводка loudnorm (JSON)
+    печатается FFmpeg на уровне info и иначе была бы не видна."""
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info", *args]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AudioError(f"Не удалось запустить FFmpeg ({step_name}): {exc}") from exc
+    if result.returncode != 0:
+        stderr_tail = "\n".join(result.stderr.strip().splitlines()[-8:])
+        raise AudioError(f"FFmpeg завершился с ошибкой на шаге «{step_name}»:\n{stderr_tail}")
+    return result.stderr
+
+
+def _parse_loudnorm_json(stderr: str, step_name: str) -> dict[str, Any]:
+    start = stderr.rfind("{")
+    if start == -1:
+        raise AudioError(f"Не удалось прочитать результат измерения громкости ({step_name})")
+    try:
+        return json.loads(stderr[start:])
+    except json.JSONDecodeError as exc:
+        raise AudioError(f"Не удалось разобрать результат измерения громкости ({step_name}): {exc}") from exc
 
 
 def _silence(duration: float, out_path: Path) -> None:
@@ -193,27 +219,61 @@ def mix_final_audio(
     sfx_path: Path,
     total_duration: float,
     out_path: Path,
-) -> None:
+    work_dir: Path,
+) -> float:
     """Сводит голос, музыку и эффекты и мастерит громкость для YouTube
-    (-14 LUFS, true peak -1 dBTP)."""
+    (-14 LUFS, true peak -1 dBTP) двухпроходным loudnorm: сначала
+    измеряет реальную громкость смеси, потом применяет коррекцию по
+    измеренным значениям — это заметно точнее однопроходного режима
+    (однопроходный давал ошибку в 2-3 LUFS от цели).
+
+    Возвращает фактически достигнутую интегральную громкость (LUFS) —
+    её показывает второй проход loudnorm по своим же измерениям, без
+    отдельного третьего прохода-проверки.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    filter_complex = (
-        "[0:a][1:a][2:a]amix=inputs=3:duration=longest:normalize=0,"
-        f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TRUE_PEAK}:LRA=11[out]"
-    )
+    mixed_path = work_dir / "_mixed_raw.wav"
+
     _run_ffmpeg(
         [
             "-i", str(voice_path),
             "-i", str(music_path),
             "-i", str(sfx_path),
-            "-filter_complex", filter_complex,
+            "-filter_complex", "[0:a][1:a][2:a]amix=inputs=3:duration=longest:normalize=0[out]",
             "-map", "[out]",
             "-t", f"{total_duration:.3f}",
             "-ar", str(SAMPLE_RATE),
-            str(out_path),
+            str(mixed_path),
         ],
-        "финальное сведение и мастеринг",
+        "предварительное сведение",
     )
+
+    measure_stderr = _run_ffmpeg_loudnorm_pass(
+        [
+            "-i", str(mixed_path),
+            "-af", f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TRUE_PEAK}:LRA=11:print_format=json",
+            "-f", "null", "-",
+        ],
+        "измерение громкости",
+    )
+    measured = _parse_loudnorm_json(measure_stderr, "измерение громкости")
+
+    apply_filter = (
+        f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TRUE_PEAK}:LRA=11:"
+        f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
+        f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
+        f"offset={measured['target_offset']}:linear=true:print_format=json"
+    )
+    apply_stderr = _run_ffmpeg_loudnorm_pass(
+        ["-i", str(mixed_path), "-af", apply_filter, "-ar", str(SAMPLE_RATE), str(out_path)],
+        "финальный мастеринг громкости",
+    )
+    achieved = _parse_loudnorm_json(apply_stderr, "финальный мастеринг громкости")
+
+    try:
+        return float(achieved["output_i"])
+    except (KeyError, ValueError):
+        return float(measured.get("output_i", TARGET_LUFS))
 
 
 def render_audio(
@@ -224,9 +284,12 @@ def render_audio(
     total_duration: float,
     out_path: Path,
     work_dir: Path,
-) -> None:
+) -> float:
     """Полный конвейер: голос → музыка (+тишина, +приглушение) → эффекты
-    → финальное сведение с мастерингом громкости."""
+    → финальное сведение с мастерингом громкости.
+
+    Возвращает фактически достигнутую громкость (LUFS) финального файла.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
 
     voice_path = work_dir / "voice_processed.wav"
@@ -244,4 +307,4 @@ def render_audio(
     sfx_path = work_dir / "sfx_bed.wav"
     build_sfx_bed(sfx_cues, total_duration, sfx_path)
 
-    mix_final_audio(voice_path, music_ducked_path, sfx_path, total_duration, out_path)
+    return mix_final_audio(voice_path, music_ducked_path, sfx_path, total_duration, out_path, work_dir)

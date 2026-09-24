@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,13 +47,13 @@ class RenderMode:
 def preview_mode(vertical: bool = False) -> RenderMode:
     size = PREVIEW_SIZE_VERTICAL if vertical else PREVIEW_SIZE
     name = "preview_vertical" if vertical else "preview"
-    return RenderMode(name, *size, video_preset="veryfast", crf=28, audio_bitrate="192k")
+    return RenderMode(name, *size, video_preset="veryfast", crf=26, audio_bitrate="128k")
 
 
 def final_mode(vertical: bool = False) -> RenderMode:
     size = FINAL_SIZE_VERTICAL if vertical else FINAL_SIZE
     name = "final_vertical" if vertical else "final"
-    return RenderMode(name, *size, video_preset="slow", crf=18, audio_bitrate="320k")
+    return RenderMode(name, *size, video_preset="slow", crf=20, audio_bitrate="192k")
 
 
 @dataclass
@@ -64,6 +65,10 @@ class RenderSummary:
     total_duration: float = 0.0
     ai_screen_time: float = 0.0
     total_screen_time: float = 0.0
+    achieved_lufs: float | None = None
+    shots_total: int = 0
+    shots_from_cache: int = 0
+    render_seconds: float = 0.0
 
 
 def _hash_payload(payload: Any) -> str:
@@ -89,25 +94,30 @@ def _render_shots(
     project_dir: Path,
     cache_dir: Path,
     mode: RenderMode,
+    look: dict[str, Any],
     progress: Callable[[str], None] | None,
-) -> tuple[list[Path], list[str]]:
+) -> tuple[list[Path], list[str], int]:
     warnings: list[str] = []
     clip_paths: list[Path] = []
+    cache_hits = 0
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for i, timed in enumerate(timeline, start=1):
         shot = _strip_fx(timed.shot) if mode.no_fx else timed.shot
         cache_key = _hash_payload(
-            {"shot": shot, "duration": round(timed.duration, 3), "w": mode.width, "h": mode.height, "fps": FPS}
+            {"shot": shot, "duration": round(timed.duration, 3), "w": mode.width, "h": mode.height, "fps": FPS, "look": look}
         )
         clip_path = cache_dir / f"{shot.get('id', i)}_{cache_key}.mp4"
         if not clip_path.is_file() or not video.has_video_stream(clip_path):
-            result = video.render_shot(shot, timed.duration, project_dir, clip_path, mode.width, mode.height, FPS)
+            result = video.render_shot(shot, timed.duration, project_dir, clip_path, mode.width, mode.height, FPS, look)
             warnings.extend(result.warnings)
+            _progress(progress, f"Кадр {i}/{len(timeline)} готов ({shot.get('id', '?')})")
+        else:
+            cache_hits += 1
+            _progress(progress, f"Кадр {i}/{len(timeline)} — взят из кэша ({shot.get('id', '?')})")
         clip_paths.append(clip_path)
-        _progress(progress, f"Кадр {i}/{len(timeline)} готов ({shot.get('id', '?')})")
 
-    return clip_paths, warnings
+    return clip_paths, warnings, cache_hits
 
 
 def _resolve_music_cues(
@@ -191,7 +201,9 @@ def render_project(
     mode: RenderMode,
     model_size: str = align.DEFAULT_MODEL_SIZE,
     progress: Callable[[str], None] | None = None,
+    allow_reorder: bool = False,
 ) -> RenderSummary:
+    start_time = time.monotonic()
     output_dir = project_dir / "output"
     cache_dir = output_dir / ".cache" / "shots"
     work_dir = output_dir / ".cache" / "audio"
@@ -209,10 +221,21 @@ def render_project(
         else:
             align.generate_srt(words, output_dir / "subtitles.srt")
 
-    timeline, timeline_issues = align.build_timeline(plan, words)
+    timeline, timeline_issues = align.build_timeline(plan, words, allow_reorder)
     summary.issues.extend(timeline_issues)
     if not timeline:
         raise RenderError("В плане нет ни одного кадра, который удалось разместить на таймлайне")
+
+    order_errors = [
+        i for i in timeline_issues if i.level == "error" and "не совпадает с порядком в озвучке" in i.message
+    ]
+    if order_errors:
+        details = "\n".join(f"  - {i.format()}" for i in order_errors)
+        raise RenderError(
+            f"Порядок кадров в плане не совпадает с порядком в озвучке — рендер остановлен, "
+            f"чтобы не собрать ролик с перепутанными кадрами:\n{details}\n"
+            f"Исправьте порядок кадров в plan.json или запустите с --allow-reorder, если это осознанно."
+        )
 
     total_duration = timeline[-1].start + timeline[-1].duration
     summary.total_duration = total_duration
@@ -228,7 +251,7 @@ def render_project(
     if not mode.no_sound:
         _progress(progress, "Свожу звук...")
         audio_out = output_dir / (f"{mode.name}_audio.wav" if not mode.audio_only else "audio_only.wav")
-        audio.render_audio(
+        summary.achieved_lufs = audio.render_audio(
             voice_paths=[project_dir / v for v in voice_files],
             music_cues=music_cues,
             sfx_cues=sfx_cues,
@@ -242,15 +265,24 @@ def render_project(
     if mode.audio_only:
         summary.output_path = audio_path or output_dir / "audio_only.wav"
         summary.report_path = output_dir / f"report_{mode.name}.txt"
+        summary.render_seconds = time.monotonic() - start_time
         report.write_render_report(
             summary.report_path, plan, timeline, summary.issues, summary.warnings,
             total_duration, summary.ai_screen_time, summary.total_screen_time,
+            summary.achieved_lufs, render_seconds=summary.render_seconds,
         )
         return summary
 
+    look = {} if mode.no_fx else (plan.get("look") or {})
+    if look.get("lut"):
+        look = dict(look)
+        look["lut"] = str(project_dir / look["lut"])
+
     _progress(progress, f"Рендерю {len(timeline)} кадров...")
-    clip_paths, shot_warnings = _render_shots(timeline, project_dir, cache_dir, mode, progress)
+    clip_paths, shot_warnings, cache_hits = _render_shots(timeline, project_dir, cache_dir, mode, look, progress)
     summary.warnings.extend(shot_warnings)
+    summary.shots_total = len(timeline)
+    summary.shots_from_cache = cache_hits
 
     transitions: list[tuple[str, float]] = [("cut", 0.0)]
     for timed in timeline[1:]:
@@ -259,18 +291,13 @@ def render_project(
     end_screen = plan.get("end_screen")
     if end_screen:
         end_path = cache_dir / "end_screen.mp4"
-        video.render_end_screen(project_dir / end_screen["asset"], float(end_screen["duration"]), end_path, mode.width, mode.height, FPS)
+        video.render_end_screen(project_dir / end_screen["asset"], float(end_screen["duration"]), end_path, mode.width, mode.height, FPS, look)
         clip_paths.append(end_path)
         transitions.append(("cut", 0.0))
 
-    look = {} if mode.no_fx else (plan.get("look") or {})
-    if look.get("lut"):
-        look = dict(look)
-        look["lut"] = str(project_dir / look["lut"])
-
     _progress(progress, "Собираю видеоряд...")
     assembled_path = output_dir / ".cache" / f"{mode.name}_video.mp4"
-    video.assemble_video(clip_paths, transitions, assembled_path, mode.width, mode.height, FPS, look)
+    video.assemble_video(clip_paths, transitions, assembled_path, mode.width, mode.height, FPS)
 
     _progress(progress, "Свожу видео и звук вместе...")
     _mux(assembled_path, audio_path, summary.output_path, mode)
@@ -283,10 +310,12 @@ def render_project(
         except export.ExportError as exc:
             summary.warnings.append(f"экспорт таймлайна пропущен: {exc}")
 
+    summary.render_seconds = time.monotonic() - start_time
     summary.report_path = output_dir / f"report_{mode.name}.txt"
     report.write_render_report(
         summary.report_path, plan, timeline, summary.issues, summary.warnings,
         total_duration, summary.ai_screen_time, summary.total_screen_time,
+        summary.achieved_lufs, summary.shots_total, summary.shots_from_cache, summary.render_seconds,
     )
 
     return summary

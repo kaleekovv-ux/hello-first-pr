@@ -71,12 +71,20 @@ def write_render_report(
     total_duration: float,
     ai_screen_time: float,
     total_screen_time: float,
+    achieved_lufs: float | None = None,
+    shots_total: int = 0,
+    shots_from_cache: int = 0,
+    render_seconds: float = 0.0,
 ) -> None:
     lines: list[str] = []
     lines.append("Отчёт сборки ролика AutoEdit")
     lines.append(f"Название ролика: {plan.get('title', '(не указано)')}")
     lines.append(f"Длительность: {total_duration:.1f} сек ({_format_timecode(total_duration)})")
     lines.append(f"Кадров собрано: {len(timeline)}")
+    if shots_total:
+        lines.append(f"  из них взято из кэша (без пересчёта): {shots_from_cache} из {shots_total}")
+    if render_seconds > 0:
+        lines.append(f"Время сборки: {render_seconds:.0f} сек")
     lines.append("")
 
     errors = [i for i in issues if i.level == "error"]
@@ -125,6 +133,14 @@ def write_render_report(
         "отдельно момент \"музыка громче голоса\" не размечается."
     )
     lines.append("")
+
+    if achieved_lufs is not None:
+        from .audio import TARGET_LUFS
+
+        deviation = achieved_lufs - TARGET_LUFS
+        verdict = "в норме" if abs(deviation) <= 1.0 else f"отклонение {deviation:+.1f} LU от цели"
+        lines.append(f"Громкость готового файла: {achieved_lufs:.1f} LUFS (цель {TARGET_LUFS:.0f} LUFS, {verdict})")
+        lines.append("")
 
     chapters: list[tuple[str, float]] = []
     seen_chapters: set[str] = set()

@@ -200,11 +200,25 @@ def resolve_anchor_starts(
     return starts, issues
 
 
+def _describe_shot_position(shot: dict[str, Any]) -> str:
+    anchor = shot.get("anchor")
+    if anchor:
+        return f'"{anchor}"'
+    return f'start={shot.get("start")}'
+
+
 def build_timeline(
-    plan: dict[str, Any], words: list[Word]
+    plan: dict[str, Any], words: list[Word], allow_reorder: bool = False
 ) -> tuple[list[TimedShot], list[ValidationIssue]]:
     """Строит финальный таймлайн: во сколько секунд начинается и сколько
-    длится каждый кадр плана. Кадры сортируются по времени начала."""
+    длится каждый кадр плана. Кадры сортируются по времени начала.
+
+    Если кадр в плане идёт раньше другого, а по факту звучит позже него
+    (порядок в plan.json не совпадает с порядком в озвучке) — это
+    считается ошибкой (программа раньше молча переставляла такие кадры,
+    и несовпадение легко было не заметить). allow_reorder=True снижает
+    это до предупреждения.
+    """
     shots = plan.get("shots", [])
     anchor_starts, issues = resolve_anchor_starts(shots, words)
 
@@ -220,6 +234,19 @@ def build_timeline(
             if start is None:
                 continue
         resolved.append((shot, float(start)))
+
+    for i in range(1, len(resolved)):
+        prev_shot, prev_start = resolved[i - 1]
+        shot, start = resolved[i]
+        if start < prev_start:
+            message = (
+                f"Кадр {shot.get('id', '?')} ({_describe_shot_position(shot)}) найден на {start:.1f} сек — "
+                f"это раньше кадра {prev_shot.get('id', '?')} ({prev_start:.1f} сек), хотя в плане "
+                f"{shot.get('id', '?')} идёт после {prev_shot.get('id', '?')}. Порядок кадров в plan.json "
+                f"не совпадает с порядком в озвучке — проверьте, в каком порядке склеены куски голоса, "
+                f"или переставьте кадр в plan.json (или запустите с --allow-reorder, если это осознанный выбор)."
+            )
+            issues.append(ValidationIssue("warning" if allow_reorder else "error", shot.get("id", "?"), message))
 
     resolved.sort(key=lambda pair: pair[1])
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from autoedit.demo import generate_demo_project
-from autoedit.render import RenderMode, preview_mode, render_project
+from autoedit.render import RenderError, RenderMode, preview_mode, render_project
 
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
@@ -52,6 +52,24 @@ class RenderProjectIntegrationTests(unittest.TestCase):
         summary = render_project(self.project_dir, self.plan, mode)
         self.assertTrue(summary.output_path.is_file())
         self.assertEqual(summary.output_path.suffix, ".wav")
+
+    def test_out_of_order_shots_halt_render_by_default(self) -> None:
+        scrambled_plan = dict(self.plan)
+        shots = list(scrambled_plan["shots"])
+        shots[0], shots[1] = shots[1], shots[0]  # D02 (start=3.0) now listed before D01 (start=0.0)
+        scrambled_plan["shots"] = shots
+
+        with self.assertRaises(RenderError):
+            render_project(self.project_dir, scrambled_plan, preview_mode())
+
+    def test_out_of_order_shots_allowed_with_flag(self) -> None:
+        scrambled_plan = dict(self.plan)
+        shots = list(scrambled_plan["shots"])
+        shots[0], shots[1] = shots[1], shots[0]
+        scrambled_plan["shots"] = shots
+
+        summary = render_project(self.project_dir, scrambled_plan, preview_mode(), allow_reorder=True)
+        self.assertTrue(summary.output_path.is_file())
 
     def test_no_sound_mode_output_has_no_audio_stream(self) -> None:
         import subprocess

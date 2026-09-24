@@ -34,7 +34,7 @@ class RenderAudioIntegrationTests(unittest.TestCase):
             _make_tone(sfx, 0.3)
 
             out_path = tmp_path / "final.wav"
-            audio.render_audio(
+            achieved_lufs = audio.render_audio(
                 voice_paths=[voice],
                 music_cues=[audio.MusicCue(asset=music, start=0.0, end=6.0, volume=0.2, fade_in=0.2, fade_out=0.5)],
                 sfx_cues=[audio.SfxCue(asset=sfx, time=3.0, volume=0.5)],
@@ -50,6 +50,10 @@ class RenderAudioIntegrationTests(unittest.TestCase):
                 capture_output=True, text=True, check=True,
             )
             self.assertAlmostEqual(float(duration_result.stdout.strip()), 6.0, delta=0.2)
+
+            # Двухпроходный loudnorm должен попадать в цель заметно точнее
+            # однопроходного (тот на реальном проекте давал -16.7 вместо -14).
+            self.assertAlmostEqual(achieved_lufs, audio.TARGET_LUFS, delta=1.0)
 
     def test_empty_music_and_sfx_still_produce_output(self) -> None:
         with TemporaryDirectory() as tmp:

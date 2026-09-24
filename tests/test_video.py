@@ -76,6 +76,39 @@ class RenderShotIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(duration, 2.0, delta=0.15)
             self.assertEqual(result.warnings, [])
 
+    def test_render_shot_with_text_and_look_does_not_crash(self) -> None:
+        with TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            asset = project_dir / "assets" / "ai" / "clip.mp4"
+            asset.parent.mkdir(parents=True)
+            import subprocess
+
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=red:size=640x360:rate=30:duration=5",
+                    "-pix_fmt", "yuv420p", str(asset),
+                ],
+                check=True,
+            )
+
+            shot = {
+                "id": "T2",
+                "asset": "assets/ai/clip.mp4",
+                "motion": "static",
+                "text": "3 DAYS WITHOUT WATER",
+                "text_style": {"highlight": "3 DAYS", "position": "top"},
+            }
+            out_path = project_dir / "out.mp4"
+            result = video.render_shot(
+                shot, 2.0, project_dir, out_path, width=320, height=180, fps=30,
+                look={"grain": 0.3, "vignette": 0.3},
+            )
+
+            self.assertTrue(out_path.is_file())
+            self.assertTrue(video.has_video_stream(out_path))
+            self.assertEqual(result.warnings, [])
+
     def test_missing_asset_raises(self) -> None:
         with TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -133,6 +166,43 @@ class HasVideoStreamTests(unittest.TestCase):
                 check=True,
             )
             self.assertTrue(video.has_video_stream(clip))
+
+
+class BuildTextFiltersTests(unittest.TestCase):
+    def test_bundled_font_is_found(self) -> None:
+        self.assertTrue(video.BUNDLED_FONT.is_file())
+        self.assertEqual(video.find_bold_font(), str(video.BUNDLED_FONT))
+
+    def test_simple_text_produces_one_drawtext(self) -> None:
+        filters, warn = video.build_text_filters("HELLO", None, 1920, 1080, 3.0)
+        self.assertIsNone(warn)
+        self.assertEqual(len(filters), 1)
+        self.assertIn("text='HELLO'", filters[0])
+
+    def test_highlight_splits_into_two_drawtext_with_gap_preserved(self) -> None:
+        filters, warn = video.build_text_filters(
+            "3 DAYS WITHOUT WATER", {"highlight": "3 DAYS"}, 1920, 1080, 3.0
+        )
+        self.assertIsNone(warn)
+        self.assertEqual(len(filters), 2)
+        self.assertIn("text='3 DAYS'", filters[0])
+        self.assertIn(video.DEFAULT_HIGHLIGHT_COLOR, filters[0])
+        self.assertIn("text='WITHOUT WATER'", filters[1])
+
+    def test_long_text_wraps_to_two_lines(self) -> None:
+        long_text = "THIS IS A VERY LONG TITLE THAT SHOULD NOT FIT ON ONE LINE AT ALL"
+        filters, warn = video.build_text_filters(long_text, {"size": 96}, 1920, 1080, 3.0)
+        self.assertIsNone(warn)
+        y_values = set()
+        for f in filters:
+            for part in f.split(":"):
+                if part.startswith("y="):
+                    y_values.add(part)
+        self.assertGreaterEqual(len(y_values), 2)
+
+    def test_fade_in_out_alpha_expression_present(self) -> None:
+        filters, _warn = video.build_text_filters("HI", None, 1920, 1080, 3.0)
+        self.assertIn(f"alpha='if(lt(t,{video.TEXT_FADE_IN})", filters[0])
 
 
 if __name__ == "__main__":
