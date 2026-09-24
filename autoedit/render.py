@@ -94,7 +94,7 @@ def _render_shots(
             {"shot": shot, "duration": round(timed.duration, 3), "w": mode.width, "h": mode.height, "fps": FPS}
         )
         clip_path = cache_dir / f"{shot.get('id', i)}_{cache_key}.mp4"
-        if not clip_path.is_file():
+        if not clip_path.is_file() or not video.has_video_stream(clip_path):
             result = video.render_shot(shot, timed.duration, project_dir, clip_path, mode.width, mode.height, FPS)
             warnings.extend(result.warnings)
         clip_paths.append(clip_path)

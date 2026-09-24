@@ -111,5 +111,29 @@ class RenderShotIntegrationTests(unittest.TestCase):
             self.assertTrue(any("source_start" in w for w in result.warnings))
 
 
+@unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg не установлен в этом окружении")
+class HasVideoStreamTests(unittest.TestCase):
+    def test_broken_empty_file_reports_false(self) -> None:
+        with TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "broken.mp4"
+            broken.write_bytes(b"\x00" * 304)
+            self.assertFalse(video.has_video_stream(broken))
+
+    def test_real_clip_reports_true(self) -> None:
+        import subprocess
+
+        with TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=blue:size=320x180:rate=30:duration=1",
+                    "-pix_fmt", "yuv420p", str(clip),
+                ],
+                check=True,
+            )
+            self.assertTrue(video.has_video_stream(clip))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,24 @@ def probe_duration(path: Path) -> float | None:
         return None
 
 
+def has_video_stream(path: Path) -> bool:
+    """Проверяет, что в файле реально есть видеопоток (не пустой/битый файл)."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(result.stdout.strip())
+
+
 _FONT_CANDIDATES = [
     # Linux
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
