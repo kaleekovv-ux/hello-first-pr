@@ -83,6 +83,33 @@ class RenderShotIntegrationTests(unittest.TestCase):
             with self.assertRaises(video.VideoError):
                 video.render_shot(shot, 2.0, project_dir, project_dir / "out.mp4")
 
+    def test_source_start_beyond_clip_end_still_produces_video(self) -> None:
+        with TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            asset = project_dir / "assets" / "stock" / "clip.mp4"
+            asset.parent.mkdir(parents=True)
+            import subprocess
+
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=12",
+                    "-pix_fmt", "yuv420p", str(asset),
+                ],
+                check=True,
+            )
+
+            # source_start (19s) намного больше длины исходника (12s) —
+            # раньше это давало пустой (0 кадров) выходной файл.
+            shot = {"id": "T1", "asset": "assets/stock/clip.mp4", "source_start": 19.0, "motion": "zoom_in"}
+            out_path = project_dir / "out.mp4"
+            result = video.render_shot(shot, 3.0, project_dir, out_path, width=320, height=180, fps=30)
+
+            self.assertTrue(out_path.is_file())
+            duration = video.probe_duration(out_path)
+            self.assertAlmostEqual(duration, 3.0, delta=0.15)
+            self.assertTrue(any("source_start" in w for w in result.warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

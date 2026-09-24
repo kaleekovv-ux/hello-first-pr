@@ -215,6 +215,13 @@ def render_shot(
         speed, freeze_extra, warn = 1.0, 0.0, None
     else:
         source_duration = probe_duration(asset_path)
+        if source_duration is not None and source_start >= source_duration:
+            clamped_start = max(source_duration - 0.1, 0.0)
+            warnings.append(
+                f'Кадр {shot.get("id", "?")}: source_start={source_start:.2f} сек больше длины исходника '
+                f'({source_duration:.2f} сек) — начало сдвинуто на {clamped_start:.2f} сек, иначе кадр был бы пустым'
+            )
+            source_start = clamped_start
         speed, freeze_extra, warn = _plan_speed_and_freeze(source_duration, source_start, duration)
     if warn:
         warnings.append(f'Кадр {shot.get("id", "?")}: {warn}')
