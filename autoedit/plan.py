@@ -198,8 +198,14 @@ def _check_music(project_dir: Path, music_list: Any, issues: list[ValidationIssu
             issues.append(ValidationIssue("error", label, "запись о музыке должна быть объектом"))
             continue
         _check_asset_field(project_dir, label, track.get("asset"), issues)
-        if not track.get("from_anchor") or not track.get("to_anchor"):
-            issues.append(ValidationIssue("error", label, 'нужно указать "from_anchor" и "to_anchor"'))
+        has_anchors = bool(track.get("from_anchor")) and bool(track.get("to_anchor"))
+        has_explicit = isinstance(track.get("start"), (int, float)) and isinstance(track.get("end"), (int, float))
+        if not has_anchors and not has_explicit:
+            issues.append(
+                ValidationIssue(
+                    "error", label, 'нужно указать либо "from_anchor" и "to_anchor", либо оба поля "start" и "end"'
+                )
+            )
 
 
 def validate_plan(data: dict[str, Any], project_dir: Path) -> list[ValidationIssue]:

@@ -1,9 +1,9 @@
 """Генератор демо-проекта: фальшивые ассеты и небольшой план.json,
 чтобы можно было проверить программу без ваших реальных файлов.
 
-Тайминги кадров в демо-плане заданы явно ("start"/"duration"), а не
-через anchor — привязка к словам диктора появится на этапе 2, когда
-будет готово распознавание речи.
+Тайминги кадров и музыки в демо-плане заданы явно ("start"/"duration",
+"start"/"end") вместо anchor — озвучка демо-проекта это просто тон, не
+настоящая речь, распознавать в ней нечего.
 """
 
 from __future__ import annotations
@@ -107,6 +107,16 @@ def _build_demo_plan() -> dict:
                 "is_ai": False,
             },
         ],
+        "music": [
+            {
+                "asset": "assets/music/test_music.mp3",
+                "start": 0.0,
+                "end": 12.0,
+                "volume": 0.18,
+                "fade_in": 0.5,
+                "fade_out": 1.0,
+            }
+        ],
         "end_screen": {"asset": "assets/graphics/C1_test_endscreen.mp4", "duration": 4},
     }
 
@@ -124,9 +134,9 @@ def generate_demo_project(target_dir: Path) -> None:
     _make_color_clip(target_dir / "assets" / "graphics" / "G1_test_greenscreen.mp4", "0x00FF00", 3.0)
     _make_color_clip(target_dir / "assets" / "graphics" / "C1_test_endscreen.mp4", "0x111133", 4.0)
     _make_tone(target_dir / "assets" / "sfx" / "test_beep.wav", frequency=880, duration=0.5)
+    _make_tone(target_dir / "assets" / "music" / "test_music.mp3", frequency=110, duration=13.0)
 
     (target_dir / "assets" / "maps").mkdir(parents=True, exist_ok=True)
-    (target_dir / "assets" / "music").mkdir(parents=True, exist_ok=True)
     (target_dir / "lut").mkdir(parents=True, exist_ok=True)
 
     plan_path = target_dir / "plan.json"

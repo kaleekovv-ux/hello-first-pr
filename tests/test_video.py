@@ -111,6 +111,33 @@ class RenderShotIntegrationTests(unittest.TestCase):
             self.assertTrue(video.has_video_stream(out_path))
             self.assertEqual(result.warnings, [])
 
+    def test_render_shot_with_debug_label_does_not_crash(self) -> None:
+        with TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            asset = project_dir / "assets" / "ai" / "clip.mp4"
+            asset.parent.mkdir(parents=True)
+            import subprocess
+
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=blue:size=640x360:rate=30:duration=5",
+                    "-pix_fmt", "yuv420p", str(asset),
+                ],
+                check=True,
+            )
+
+            shot = {"id": "T3", "asset": "assets/ai/clip.mp4", "motion": "static"}
+            out_path = project_dir / "out.mp4"
+            result = video.render_shot(
+                shot, 2.0, project_dir, out_path, width=320, height=180, fps=30,
+                debug_label='id=T3  00:05.00  anchor="привет"',
+            )
+
+            self.assertTrue(out_path.is_file())
+            self.assertTrue(video.has_video_stream(out_path))
+            self.assertEqual(result.warnings, [])
+
     def test_missing_asset_raises(self) -> None:
         with TemporaryDirectory() as tmp:
             project_dir = Path(tmp)

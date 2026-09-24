@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+import time
 from pathlib import Path
 
 from . import align as align_module
+from . import colorlog
 from . import demo as demo_module
 from . import env as env_module
 from . import plan as plan_module
@@ -14,6 +17,29 @@ from . import render as render_module
 from . import report as report_module
 from . import sheet as sheet_module
 from . import voice as voice_module
+
+
+def _print_render_summary(summary: render_module.RenderSummary) -> None:
+    """Короткая (3-5 строк) итоговая сводка после сборки ролика."""
+    issue_errors = [i for i in summary.issues if i.level == "error"]
+    issue_warnings = [i for i in summary.issues if i.level == "warning"]
+    total_warnings = len(summary.warnings) + len(issue_warnings)
+    has_errors = bool(issue_errors)
+
+    status_line = "ГОТОВО" if not has_errors else "ЗАВЕРШЕНО С ОШИБКАМИ"
+    print(colorlog.err(status_line) if has_errors else colorlog.ok(status_line))
+    print(f"Файл: {summary.output_path}")
+    cache_part = f", из кэша: {summary.shots_from_cache}/{summary.shots_total}" if summary.shots_total else ""
+    print(
+        f"Длительность: {summary.total_duration:.1f} сек, кадров: {summary.shots_total}{cache_part}, "
+        f"время сборки: {summary.render_seconds:.0f} сек"
+    )
+    if summary.achieved_lufs is not None:
+        print(f"Громкость: {summary.achieved_lufs:.1f} LUFS")
+    warn_err_line = f"Предупреждений: {total_warnings}, ошибок: {len(issue_errors)}."
+    print(colorlog.warn(warn_err_line) if total_warnings and not has_errors else warn_err_line)
+    if summary.report_path:
+        print(f"Отчёт: {summary.report_path}")
 
 
 def _print_env_status(status: env_module.EnvStatus) -> None:
@@ -38,10 +64,18 @@ def cmd_check(args: argparse.Namespace) -> int:
     try:
         data = plan_module.load_plan_file(plan_path)
     except plan_module.PlanError as exc:
-        print(f"ОШИБКА: {exc}")
+        print(colorlog.err(f"ОШИБКА: {exc}"))
         return 1
 
     issues = plan_module.validate_plan(data, project_dir)
+
+    script_lines = None
+    if args.script:
+        try:
+            script_lines = voice_module.load_script(Path(args.script))
+        except voice_module.VoiceError as exc:
+            print(colorlog.err(f"ОШИБКА: {exc}"))
+            return 1
 
     voice_files = data.get("voice")
     output_dir = project_dir / "output"
@@ -56,7 +90,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         else:
             _timeline, align_issues = align_module.build_timeline(data, words, args.allow_reorder)
             issues.extend(align_issues)
-            align_module.generate_srt(words, output_dir / "subtitles.srt")
+            align_module.generate_srt(words, output_dir / "subtitles.srt", script_lines)
             print(f"Субтитры сохранены: {output_dir / 'subtitles.srt'}")
 
     errors = [i for i in issues if i.level == "error"]
@@ -66,11 +100,14 @@ def cmd_check(args: argparse.Namespace) -> int:
     report_module.write_check_report(report_path, data, issues, status)
 
     for issue in issues:
-        marker = "ОШИБКА" if issue.level == "error" else "предупреждение"
-        print(f"[{marker}] {issue.format()}")
+        if issue.level == "error":
+            print(colorlog.err(f"[ОШИБКА] {issue.format()}"))
+        else:
+            print(colorlog.warn(f"[предупреждение] {issue.format()}"))
 
     print()
-    print(f"Готово: {len(errors)} ошибок, {len(warnings)} предупреждений.")
+    summary_line = f"Готово: {len(errors)} ошибок, {len(warnings)} предупреждений."
+    print(colorlog.err(summary_line) if errors else colorlog.ok(summary_line))
     print(f"Отчёт сохранён: {report_path}")
 
     return 1 if errors else 0
@@ -110,21 +147,22 @@ def cmd_render(args: argparse.Namespace) -> int:
     try:
         data = plan_module.load_plan_file(plan_path)
     except plan_module.PlanError as exc:
-        print(f"ОШИБКА: {exc}")
+        print(colorlog.err(f"ОШИБКА: {exc}"))
         return 1
 
     schema_issues = plan_module.validate_plan(data, project_dir)
     schema_errors = [i for i in schema_issues if i.level == "error"]
     if schema_errors:
-        print("План не проходит базовую проверку — сначала исправьте это (autoedit check покажет подробности):")
+        print(colorlog.err("План не проходит базовую проверку — сначала исправьте это (autoedit check покажет подробности):"))
         for issue in schema_errors:
-            print(f"  [ОШИБКА] {issue.format()}")
+            print(colorlog.err(f"  [ОШИБКА] {issue.format()}"))
         return 1
 
     mode = render_module.final_mode(args.vertical) if args.final else render_module.preview_mode(args.vertical)
     mode.no_fx = args.check_no_fx
     mode.no_sound = args.check_no_sound
     mode.audio_only = args.check_audio_only
+    mode.debug = args.debug
 
     label = {
         (False, False, False): "финал" if args.final else "черновик",
@@ -134,29 +172,137 @@ def cmd_render(args: argparse.Namespace) -> int:
     }.get((mode.no_fx, mode.no_sound, mode.audio_only), "рендер")
     if args.vertical and not mode.audio_only:
         label += ", вертикальный 9:16"
+    if mode.debug and not mode.audio_only:
+        label += ", с debug-меткой на кадрах"
     print(f"Собираю ролик ({label})...")
+
+    script_lines = None
+    if args.script:
+        try:
+            script_lines = voice_module.load_script(Path(args.script))
+        except voice_module.VoiceError as exc:
+            print(colorlog.err(f"ОШИБКА: {exc}"))
+            return 1
 
     def progress(message: str) -> None:
         print(f"  {message}")
 
     try:
-        summary = render_module.render_project(project_dir, data, mode, args.model, progress, args.allow_reorder)
+        summary = render_module.render_project(
+            project_dir, data, mode, args.model, progress, args.allow_reorder, script_lines
+        )
     except render_module.RenderError as exc:
-        print(f"ОШИБКА: {exc}")
+        print(colorlog.err(f"ОШИБКА: {exc}"))
         return 1
 
     print()
     for w in summary.warnings:
-        print(f"[предупреждение] {w}")
+        print(colorlog.warn(f"[предупреждение] {w}"))
     for issue in summary.issues:
-        marker = "ОШИБКА" if issue.level == "error" else "предупреждение"
-        print(f"[{marker}] {issue.format()}")
+        if issue.level == "error":
+            print(colorlog.err(f"[ОШИБКА] {issue.format()}"))
+        else:
+            print(colorlog.warn(f"[предупреждение] {issue.format()}"))
 
     print()
-    print(f"Готово: {summary.output_path}")
-    if summary.report_path:
-        print(f"Отчёт: {summary.report_path}")
+    _print_render_summary(summary)
     return 1 if any(i.level == "error" for i in summary.issues) else 0
+
+
+_SHOT_PROGRESS_RE = re.compile(r"Кадр (\d+)/(\d+)")
+
+
+def _make_progress_printer(prefix: str):
+    def progress(message: str) -> None:
+        match = _SHOT_PROGRESS_RE.search(message)
+        if match:
+            done, total = int(match.group(1)), int(match.group(2))
+            percent = round(100 * done / total)
+            print(f"  [{prefix}] {percent:3d}% — {message}")
+        else:
+            print(f"  [{prefix}] {message}")
+
+    return progress
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    """check -> preview -> (если без ошибок) final, одной командой."""
+    project_dir = Path(args.project).resolve()
+    overall_start = time.monotonic()
+
+    print(colorlog.bold(f"=== AutoEdit build: {project_dir} ==="))
+
+    print()
+    print(colorlog.bold("[1/3] Проверка плана..."))
+    check_ns = argparse.Namespace(
+        project=str(project_dir), model=args.model, allow_reorder=args.allow_reorder, script=args.script
+    )
+    if cmd_check(check_ns) != 0:
+        print()
+        print(colorlog.err("Проверка не пройдена — сборка остановлена. Сначала исправьте ошибки выше."))
+        return 1
+
+    status = env_module.check_environment()
+    if not status.ffmpeg_ok:
+        print(colorlog.err("Не могу собрать ролик: не найден FFmpeg."))
+        print(env_module.ffmpeg_install_hint())
+        return 1
+
+    plan_path = project_dir / "plan.json"
+    try:
+        data = plan_module.load_plan_file(plan_path)
+    except plan_module.PlanError as exc:
+        print(colorlog.err(f"ОШИБКА: {exc}"))
+        return 1
+
+    script_lines = None
+    if args.script:
+        try:
+            script_lines = voice_module.load_script(Path(args.script))
+        except voice_module.VoiceError as exc:
+            print(colorlog.err(f"ОШИБКА: {exc}"))
+            return 1
+
+    print()
+    print(colorlog.bold("[2/3] Черновая сборка (preview)..."))
+    try:
+        preview_summary = render_module.render_project(
+            project_dir, data, render_module.preview_mode(args.vertical), args.model,
+            _make_progress_printer("preview"), args.allow_reorder, script_lines,
+        )
+    except render_module.RenderError as exc:
+        print(colorlog.err(f"ОШИБКА: {exc}"))
+        return 1
+    print()
+    _print_render_summary(preview_summary)
+
+    if any(i.level == "error" for i in preview_summary.issues):
+        print()
+        print(colorlog.err(
+            "В черновике есть ошибки — финальная сборка не запускается. "
+            "Посмотрите preview.mp4 и отчёт выше, исправьте план и запустите build заново."
+        ))
+        return 1
+
+    print()
+    print(colorlog.bold("[3/3] Финальная сборка (final)..."))
+    try:
+        final_summary = render_module.render_project(
+            project_dir, data, render_module.final_mode(args.vertical), args.model,
+            _make_progress_printer("final"), args.allow_reorder, script_lines,
+        )
+    except render_module.RenderError as exc:
+        print(colorlog.err(f"ОШИБКА: {exc}"))
+        return 1
+    print()
+    _print_render_summary(final_summary)
+
+    has_errors = any(i.level == "error" for i in final_summary.issues)
+    elapsed_min = (time.monotonic() - overall_start) / 60
+    print()
+    print(colorlog.err("СБОРКА ЗАВЕРШЕНА С ОШИБКАМИ") if has_errors else colorlog.ok("СБОРКА ЗАВЕРШЕНА"))
+    print(f"Общее время: {elapsed_min:.1f} мин")
+    return 1 if has_errors else 0
 
 
 def cmd_gui(_args: argparse.Namespace) -> int:
@@ -286,6 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Не считать ошибкой, если порядок кадров в плане не совпадает с порядком в озвучке (только предупреждение)",
     )
+    check_parser.add_argument(
+        "--script",
+        help="Файл сценария (по фразе на строку) — если указан, субтитры для точно совпавших "
+        "реплик будут показывать текст из сценария (например, с цифрами вроде «438»), а не то, "
+        "что распознал whisper",
+    )
     check_parser.set_defaults(func=cmd_check)
 
     demo_parser = subparsers.add_parser("demo", help="Создать тестовый проект с фальшивыми ассетами")
@@ -310,6 +462,11 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument("--check-no-sound", action="store_true", help="Без звука — понятно ли по картинке")
     render_parser.add_argument("--check-audio-only", action="store_true", help="Только звук — держится ли история на голосе и звуке")
     render_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="В углу каждого кадра — id, таймкод и anchor (если есть), чтобы легче искать проблемные места в черновике",
+    )
+    render_parser.add_argument(
         "--allow-reorder",
         action="store_true",
         help="Не останавливаться, если порядок кадров в плане не совпадает с порядком в озвучке (только предупреждение)",
@@ -319,7 +476,39 @@ def build_parser() -> argparse.ArgumentParser:
         default=align_module.DEFAULT_MODEL_SIZE,
         help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
     )
+    render_parser.add_argument(
+        "--script",
+        help="Файл сценария (по фразе на строку) — если указан, субтитры для точно совпавших "
+        "реплик будут показывать текст из сценария (например, с цифрами вроде «438»), а не то, "
+        "что распознал whisper",
+    )
     render_parser.set_defaults(func=cmd_render)
+
+    build_parser_cmd = subparsers.add_parser(
+        "build", help="Собрать ролик полностью: проверка -> черновик -> финал одной командой"
+    )
+    build_parser_cmd.add_argument("project", help="Путь к папке проекта (с plan.json)")
+    build_parser_cmd.add_argument(
+        "--vertical",
+        action="store_true",
+        help="Вертикальный формат 9:16 вместо обычного 16:9 (для preview и final)",
+    )
+    build_parser_cmd.add_argument(
+        "--allow-reorder",
+        action="store_true",
+        help="Не останавливаться, если порядок кадров в плане не совпадает с порядком в озвучке (только предупреждение)",
+    )
+    build_parser_cmd.add_argument(
+        "--model",
+        default=align_module.DEFAULT_MODEL_SIZE,
+        help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
+    )
+    build_parser_cmd.add_argument(
+        "--script",
+        help="Файл сценария (по фразе на строку) — субтитры для точно совпавших реплик покажут "
+        "текст из сценария (например, с цифрами вроде «438»)",
+    )
+    build_parser_cmd.set_defaults(func=cmd_build)
 
     gui_parser = subparsers.add_parser("gui", help="Открыть простое графическое окно (необязательно)")
     gui_parser.set_defaults(func=cmd_gui)

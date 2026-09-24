@@ -603,6 +603,7 @@ def render_shot(
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
     look: dict[str, Any] | None = None,
+    debug_label: str | None = None,
 ) -> ShotRenderResult:
     """Рендерит один кадр (видео без звука) заданной длительности."""
     warnings: list[str] = []
@@ -667,6 +668,15 @@ def render_shot(
         filters.extend(text_filters)
         if text_warn:
             warnings.append(f'Кадр {shot.get("id", "?")}: {text_warn}')
+
+    if debug_label:
+        font_path = find_bold_font()
+        if font_path:
+            escaped = _escape_drawtext(debug_label)
+            filters.append(
+                f"drawtext=fontfile='{font_path}':text='{escaped}':x=10:y=10:fontsize=20:"
+                f"fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=6"
+            )
 
     filters.append(f"fps={fps}")
     filters.append("format=yuv420p")
@@ -755,6 +765,44 @@ def render_end_screen(
     _run_ffmpeg(
         [*input_args, "-vf", filter_chain, "-t", f"{duration:.3f}", "-an", str(out_path)],
         "концевая заставка",
+    )
+
+
+def render_chapters_video(
+    chapters: list[tuple[str, float, float]],
+    total_duration: float,
+    out_path: Path,
+    width: int = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+    fps: int = DEFAULT_FPS,
+) -> None:
+    """Чёрный фон с названием текущей главы — картинка для режима
+    --check-audio-only: если история держится на голосе и звуке, по
+    такому "видео" (по сути — просто подписи глав) должно быть понятно,
+    что происходит."""
+    font = find_bold_font()
+    filters: list[str] = []
+    if font:
+        font_escaped = font.replace("\\", "/").replace(":", "\\:")
+        for name, start, end in chapters:
+            escaped = _escape_drawtext(name)
+            filters.append(
+                f"drawtext=fontfile='{font_escaped}':text='{escaped}':fontsize=h*0.06:"
+                f"fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=(h-text_h)/2:"
+                f"enable='between(t,{start:.3f},{end:.3f})'"
+            )
+    filter_chain = ",".join(filters) if filters else "null"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _run_ffmpeg(
+        [
+            "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={total_duration:.3f}",
+            "-vf", filter_chain,
+            "-t", f"{total_duration:.3f}",
+            "-an",
+            str(out_path),
+        ],
+        "чёрный фон с главами",
     )
 
 

@@ -5,7 +5,10 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from autoedit.align import (
+    Cue,
     Word,
+    _best_script_match,
+    _enforce_min_duration,
     build_timeline,
     find_anchor,
     generate_srt,
@@ -175,6 +178,67 @@ class GenerateSrtTests(unittest.TestCase):
                 if "-->" in line or line.strip().isdigit() or not line.strip():
                     continue
                 self.assertLessEqual(len(line), 42)
+
+
+class EnforceMinDurationTests(unittest.TestCase):
+    def test_short_cue_is_stretched_to_minimum(self) -> None:
+        cues = [Cue(start=0.0, end=0.2, text="да")]
+        _enforce_min_duration(cues)
+        self.assertGreaterEqual(cues[0].end - cues[0].start, 1.0)
+
+    def test_stretch_does_not_overlap_next_cue(self) -> None:
+        cues = [
+            Cue(start=0.0, end=0.2, text="да"),
+            Cue(start=0.3, end=0.6, text="нет"),
+        ]
+        _enforce_min_duration(cues)
+        self.assertLessEqual(cues[0].end, cues[1].start - 0.05 + 1e-9)
+
+    def test_long_enough_cue_is_untouched(self) -> None:
+        cues = [Cue(start=0.0, end=2.0, text="это уже достаточно долгая реплика")]
+        _enforce_min_duration(cues)
+        self.assertEqual(cues[0].end, 2.0)
+
+
+class BestScriptMatchTests(unittest.TestCase):
+    def test_close_match_is_returned(self) -> None:
+        script_lines = ["Он провёл 438 дней в открытом океане."]
+        result = _best_script_match("он провел четыреста тридцать восемь дней в открытом океане", script_lines)
+        self.assertEqual(result, script_lines[0])
+
+    def test_unrelated_text_returns_none(self) -> None:
+        script_lines = ["Он провёл 438 дней в открытом океане."]
+        result = _best_script_match("совершенно другая фраза ни о чём", script_lines)
+        self.assertIsNone(result)
+
+
+class GenerateSrtScriptMatchTests(unittest.TestCase):
+    def test_matched_cue_uses_script_wording_with_digits(self) -> None:
+        words = _words(
+            ("он", 0.0, 0.2),
+            ("провел", 0.2, 0.6),
+            ("четыреста", 0.6, 1.0),
+            ("тридцать", 1.0, 1.3),
+            ("восемь", 1.3, 1.6),
+            ("дней", 1.6, 1.9),
+            ("в", 1.9, 2.0),
+            ("открытом", 2.0, 2.4),
+            ("океане.", 2.4, 2.8),
+        )
+        script_lines = ["Он провёл 438 дней в открытом океане."]
+        with TemporaryDirectory() as tmp:
+            srt_path = Path(tmp) / "subtitles.srt"
+            generate_srt(words, srt_path, script_lines)
+            content = srt_path.read_text(encoding="utf-8")
+            self.assertIn("438", content)
+
+    def test_unmatched_cue_keeps_recognized_text(self) -> None:
+        script_lines = ["Совершенно другая строка сценария."]
+        with TemporaryDirectory() as tmp:
+            srt_path = Path(tmp) / "subtitles.srt"
+            generate_srt(SAMPLE_WORDS, srt_path, script_lines)
+            content = srt_path.read_text(encoding="utf-8")
+            self.assertIn("Imagine", content)
 
 
 if __name__ == "__main__":

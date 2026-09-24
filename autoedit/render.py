@@ -42,6 +42,7 @@ class RenderMode:
     no_fx: bool = False
     no_sound: bool = False
     audio_only: bool = False
+    debug: bool = False
 
 
 def preview_mode(vertical: bool = False) -> RenderMode:
@@ -89,6 +90,21 @@ def _strip_fx(shot: dict[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+def _format_debug_timecode(seconds: float) -> str:
+    minutes, secs = divmod(max(seconds, 0.0), 60)
+    return f"{int(minutes):02d}:{secs:05.2f}"
+
+
+def _build_debug_label(shot: dict[str, Any], start: float) -> str:
+    """Строка для --debug: id кадра, anchor (если есть) и таймкод от
+    начала озвучки — чтобы видеть по черновику, какой кадр где начинается."""
+    parts = [f"id={shot.get('id', '?')}", _format_debug_timecode(start)]
+    anchor = shot.get("anchor")
+    if anchor:
+        parts.append(f'anchor="{anchor}"')
+    return "  ".join(parts)
+
+
 def _render_shots(
     timeline: list[align.TimedShot],
     project_dir: Path,
@@ -104,12 +120,18 @@ def _render_shots(
 
     for i, timed in enumerate(timeline, start=1):
         shot = _strip_fx(timed.shot) if mode.no_fx else timed.shot
+        debug_label = _build_debug_label(shot, timed.start) if mode.debug else None
         cache_key = _hash_payload(
-            {"shot": shot, "duration": round(timed.duration, 3), "w": mode.width, "h": mode.height, "fps": FPS, "look": look}
+            {
+                "shot": shot, "duration": round(timed.duration, 3), "w": mode.width, "h": mode.height,
+                "fps": FPS, "look": look, "debug_label": debug_label,
+            }
         )
         clip_path = cache_dir / f"{shot.get('id', i)}_{cache_key}.mp4"
         if not clip_path.is_file() or not video.has_video_stream(clip_path):
-            result = video.render_shot(shot, timed.duration, project_dir, clip_path, mode.width, mode.height, FPS, look)
+            result = video.render_shot(
+                shot, timed.duration, project_dir, clip_path, mode.width, mode.height, FPS, look, debug_label
+            )
             warnings.extend(result.warnings)
             _progress(progress, f"Кадр {i}/{len(timeline)} готов ({shot.get('id', '?')})")
         else:
@@ -128,16 +150,20 @@ def _resolve_music_cues(
 
     for i, track in enumerate(plan.get("music") or []):
         label = f"музыка №{i + 1}"
-        from_match, _ = align.find_anchor(words, track.get("from_anchor", ""))
-        to_match, _ = align.find_anchor(words, track.get("to_anchor", ""))
-        if from_match is None or to_match is None:
-            issues.append(ValidationIssue("error", label, "не удалось привязать музыку к озвучке (from_anchor/to_anchor не найдены)"))
-            continue
+        if "start" in track and "end" in track:
+            start, end = float(track["start"]), float(track["end"])
+        else:
+            from_match, _ = align.find_anchor(words, track.get("from_anchor", ""))
+            to_match, _ = align.find_anchor(words, track.get("to_anchor", ""))
+            if from_match is None or to_match is None:
+                issues.append(ValidationIssue("error", label, "не удалось привязать музыку к озвучке (from_anchor/to_anchor не найдены)"))
+                continue
+            start, end = from_match.start, to_match.start
         cues.append(
             audio.MusicCue(
                 asset=project_dir / track["asset"],
-                start=from_match.start,
-                end=to_match.start,
+                start=start,
+                end=end,
                 volume=float(track.get("volume", 0.18)),
                 fade_in=float(track.get("fade_in", 0.0)),
                 fade_out=float(track.get("fade_out", 0.0)),
@@ -167,6 +193,23 @@ def _resolve_silence_windows(timeline: list[align.TimedShot]) -> list[tuple[floa
         if silence_before:
             windows.append((max(timed.start - float(silence_before), 0.0), timed.start))
     return windows
+
+
+def _extract_chapters(timeline: list[align.TimedShot], total_duration: float) -> list[tuple[str, float, float]]:
+    """Список (название главы, начало, конец) по полю "chapter" у кадров,
+    для --check-audio-only (подписи на чёрном фоне)."""
+    starts: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for timed in timeline:
+        chapter = timed.shot.get("chapter")
+        if chapter and chapter not in seen:
+            starts.append((chapter, timed.start))
+            seen.add(chapter)
+    chapters: list[tuple[str, float, float]] = []
+    for i, (name, start) in enumerate(starts):
+        end = starts[i + 1][1] if i + 1 < len(starts) else total_duration
+        chapters.append((name, start, end))
+    return chapters
 
 
 def _mux(video_path: Path | None, audio_path: Path | None, out_path: Path, mode: RenderMode) -> None:
@@ -202,15 +245,29 @@ def render_project(
     model_size: str = align.DEFAULT_MODEL_SIZE,
     progress: Callable[[str], None] | None = None,
     allow_reorder: bool = False,
+    script_lines: list[str] | None = None,
 ) -> RenderSummary:
     start_time = time.monotonic()
     output_dir = project_dir / "output"
     cache_dir = output_dir / ".cache" / "shots"
     work_dir = output_dir / ".cache" / "audio"
 
+    # Имя для файлов результата/отчёта — с суффиксами по флагам, чтобы
+    # --check-no-fx/--check-no-sound/--check-audio-only не перезаписывали
+    # обычный preview.mp4/report_preview.txt и не путались друг с другом.
+    output_name = mode.name
+    if mode.no_fx:
+        output_name += "_no_fx"
+    if mode.no_sound:
+        output_name += "_no_sound"
+    if mode.audio_only:
+        output_name += "_audio_only"
+    if mode.debug:
+        output_name += "_debug"
+
     voice_files = plan.get("voice") or []
     words: list[align.Word] = []
-    summary = RenderSummary(output_path=output_dir / f"{mode.name}.mp4")
+    summary = RenderSummary(output_path=output_dir / f"{output_name}.mp4")
 
     if voice_files and all((project_dir / v).is_file() for v in voice_files):
         _progress(progress, "Распознаю озвучку...")
@@ -219,7 +276,7 @@ def render_project(
         except align.AlignError as exc:
             summary.warnings.append(f"привязка к озвучке пропущена: {exc}")
         else:
-            align.generate_srt(words, output_dir / "subtitles.srt")
+            align.generate_srt(words, output_dir / "subtitles.srt", script_lines)
 
     timeline, timeline_issues = align.build_timeline(plan, words, allow_reorder)
     summary.issues.extend(timeline_issues)
@@ -254,7 +311,11 @@ def render_project(
     audio_path: Path | None = None
     if not mode.no_sound:
         _progress(progress, "Свожу звук...")
-        audio_out = output_dir / (f"{mode.name}_audio.wav" if not mode.audio_only else "audio_only.wav")
+        audio_out = (
+            output_dir / ".cache" / "audio_only_track.wav"
+            if mode.audio_only
+            else output_dir / f"{output_name}_audio.wav"
+        )
         summary.achieved_lufs = audio.render_audio(
             voice_paths=[project_dir / v for v in voice_files],
             music_cues=music_cues,
@@ -267,8 +328,13 @@ def render_project(
         audio_path = audio_out
 
     if mode.audio_only:
-        summary.output_path = audio_path or output_dir / "audio_only.wav"
-        summary.report_path = output_dir / f"report_{mode.name}.txt"
+        chapters = _extract_chapters(timeline, total_duration)
+        _progress(progress, "Рисую чёрный фон с главами...")
+        chapters_video_path = cache_dir.parent / "audio_only_video.mp4"
+        video.render_chapters_video(chapters, total_duration, chapters_video_path, mode.width, mode.height, FPS)
+        _mux(chapters_video_path, audio_path, summary.output_path, mode)
+
+        summary.report_path = output_dir / f"report_{output_name}.txt"
         summary.render_seconds = time.monotonic() - start_time
         report.write_render_report(
             summary.report_path, plan, timeline, summary.issues, summary.warnings,
@@ -300,7 +366,7 @@ def render_project(
         transitions.append(("cut", 0.0))
 
     _progress(progress, "Собираю видеоряд...")
-    assembled_path = output_dir / ".cache" / f"{mode.name}_video.mp4"
+    assembled_path = output_dir / ".cache" / f"{output_name}_video.mp4"
     video.assemble_video(clip_paths, transitions, assembled_path, mode.width, mode.height, FPS)
 
     _progress(progress, "Свожу видео и звук вместе...")
@@ -315,7 +381,7 @@ def render_project(
             summary.warnings.append(f"экспорт таймлайна пропущен: {exc}")
 
     summary.render_seconds = time.monotonic() - start_time
-    summary.report_path = output_dir / f"report_{mode.name}.txt"
+    summary.report_path = output_dir / f"report_{output_name}.txt"
     report.write_render_report(
         summary.report_path, plan, timeline, summary.issues, summary.warnings,
         total_duration, summary.ai_screen_time, summary.total_screen_time,

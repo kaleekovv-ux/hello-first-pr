@@ -24,6 +24,8 @@ ANCHOR_MATCH_THRESHOLD = 0.6
 PAUSE_GAP_SECONDS = 0.5
 SUBTITLE_MAX_CHARS_PER_LINE = 42
 SUBTITLE_MAX_LINES = 2
+SUBTITLE_MIN_SECONDS = 1.0
+SCRIPT_MATCH_THRESHOLD = 0.75
 
 
 class AlignError(Exception):
@@ -53,6 +55,68 @@ class TimedShot:
 
 def _normalize(text: str) -> str:
     return re.sub(r"[^\w']+", " ", text.lower()).strip()
+
+
+_RUSSIAN_NUMBER_WORDS = {
+    "ноль": 0, "один": 1, "одна": 1, "одно": 1, "одни": 1, "два": 2, "две": 2,
+    "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
+    "десять": 10, "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14,
+    "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19,
+    "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50, "шестьдесят": 60,
+    "семьдесят": 70, "восемьдесят": 80, "девяносто": 90,
+    "сто": 100, "двести": 200, "триста": 300, "четыреста": 400, "пятьсот": 500,
+    "шестьсот": 600, "семьсот": 700, "восемьсот": 800, "девятьсот": 900,
+}
+_RUSSIAN_SCALE_WORDS = {
+    "тысяча": 1000, "тысячи": 1000, "тысяч": 1000,
+    "миллион": 1_000_000, "миллиона": 1_000_000, "миллионов": 1_000_000,
+}
+
+
+def _parse_number_words(tokens: list[str], start: int) -> tuple[int, int] | None:
+    """Пытается разобрать русские числительные, начиная с tokens[start]
+    (например ["четыреста", "тридцать", "восемь"] -> 438). Возвращает
+    (значение, индекс следующего токена после числительного) или None."""
+    total = 0
+    current = 0
+    matched = False
+    i = start
+    while i < len(tokens):
+        token = tokens[i]
+        if token in _RUSSIAN_NUMBER_WORDS:
+            current += _RUSSIAN_NUMBER_WORDS[token]
+            matched = True
+            i += 1
+        elif token in _RUSSIAN_SCALE_WORDS:
+            current = current or 1
+            total += current * _RUSSIAN_SCALE_WORDS[token]
+            current = 0
+            matched = True
+            i += 1
+        else:
+            break
+    if not matched:
+        return None
+    return total + current, i
+
+
+def _numbers_to_digits(text: str) -> str:
+    """Заменяет русские числительные словами на цифры — только для
+    нечёткого сравнения текста, чтобы "четыреста тридцать восемь" и
+    "438" считались похожими."""
+    tokens = text.split()
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        parsed = _parse_number_words(tokens, i)
+        if parsed is not None:
+            value, next_i = parsed
+            result.append(str(value))
+            i = next_i
+        else:
+            result.append(tokens[i])
+            i += 1
+    return " ".join(result)
 
 
 def _voice_files_fingerprint(voice_paths: list[Path], model_size: str) -> str:
@@ -319,13 +383,15 @@ def _wrap_two_lines(text: str) -> str:
 
 
 def _group_into_cues(words: list[Word]) -> list[Cue]:
+    """Группирует слова в реплики субтитров (пока без переноса строк —
+    text здесь ещё "сырой", в одну строку)."""
     cues: list[Cue] = []
     current: list[Word] = []
 
     def flush() -> None:
         if not current:
             return
-        text = _wrap_two_lines(" ".join(w.text for w in current))
+        text = " ".join(w.text for w in current)
         cues.append(Cue(start=current[0].start, end=current[-1].end, text=text))
 
     for word in words:
@@ -344,13 +410,53 @@ def _group_into_cues(words: list[Word]) -> list[Cue]:
     return cues
 
 
-def generate_srt(words: list[Word], path: Path) -> None:
+def _enforce_min_duration(cues: list[Cue]) -> None:
+    """Не даёт реплике держаться на экране короче SUBTITLE_MIN_SECONDS,
+    не залезая при этом на начало следующей реплики."""
+    for i, cue in enumerate(cues):
+        if cue.end - cue.start >= SUBTITLE_MIN_SECONDS:
+            continue
+        desired_end = cue.start + SUBTITLE_MIN_SECONDS
+        next_start = cues[i + 1].start if i + 1 < len(cues) else None
+        if next_start is not None:
+            desired_end = min(desired_end, max(next_start - 0.05, cue.end))
+        cue.end = max(cue.end, desired_end)
+
+
+def _best_script_match(cue_text: str, script_lines: list[str]) -> str | None:
+    # Числа сравниваем в цифрах: whisper обычно распознаёт их словами
+    # ("четыреста тридцать восемь"), а в сценарии они чаще написаны
+    # цифрами ("438") — без этого такие реплики никогда бы не совпали.
+    normalized_cue = _numbers_to_digits(_normalize(cue_text))
+    best_line: str | None = None
+    best_score = 0.0
+    for line in script_lines:
+        normalized_line = _numbers_to_digits(_normalize(line))
+        score = SequenceMatcher(None, normalized_line, normalized_cue).ratio()
+        if score > best_score:
+            best_score = score
+            best_line = line
+    return best_line if best_score >= SCRIPT_MATCH_THRESHOLD else None
+
+
+def generate_srt(words: list[Word], path: Path, script_lines: list[str] | None = None) -> None:
+    """Пишет subtitles.srt. Если передан script_lines (текст сценария,
+    по фразе на строку — как в autoedit voice), реплика, уверенно
+    совпавшая с целой строкой сценария, показывается словами именно из
+    сценария (в т.ч. с цифрами вроде "438", а не "four hundred and
+    thirty-eight", если так написано в сценарии) — распознанный текст
+    используется только для таймингов и переноса такой реплики не
+    трогает."""
     cues = _group_into_cues(words)
+    _enforce_min_duration(cues)
+
     lines: list[str] = []
     for i, cue in enumerate(cues, start=1):
+        matched = _best_script_match(cue.text, script_lines) if script_lines else None
+        display_text = _wrap_two_lines(matched if matched is not None else cue.text)
         lines.append(str(i))
         lines.append(f"{_format_timestamp(cue.start)} --> {_format_timestamp(cue.end)}")
-        lines.append(cue.text)
+        lines.append(display_text)
         lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
