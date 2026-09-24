@@ -13,6 +13,7 @@ from . import plan as plan_module
 from . import render as render_module
 from . import report as report_module
 from . import sheet as sheet_module
+from . import voice as voice_module
 
 
 def _print_env_status(status: env_module.EnvStatus) -> None:
@@ -191,6 +192,81 @@ def cmd_sheet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_voice(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project).resolve()
+    script_path = Path(args.script).resolve()
+    chunks_dir = Path(args.from_folder).resolve()
+
+    status = env_module.check_environment()
+    if not status.ffmpeg_ok:
+        print("Не могу собрать озвучку: не найден FFmpeg.")
+        print(env_module.ffmpeg_install_hint())
+        return 1
+
+    try:
+        script_lines = voice_module.load_script(script_path)
+        chunk_paths = voice_module.find_audio_chunks(chunks_dir)
+    except voice_module.VoiceError as exc:
+        print(f"ОШИБКА: {exc}")
+        return 1
+
+    print(f"Фраз в сценарии: {len(script_lines)}. Кусков озвучки: {len(chunk_paths)}.")
+    print("Распознаю куски (faster-whisper) — при первом запуске может занять время...")
+    try:
+        chunk_texts = voice_module.transcribe_chunks(chunk_paths, args.model)
+    except voice_module.VoiceError as exc:
+        print(f"ОШИБКА: {exc}")
+        return 1
+
+    report = voice_module.match_chunks_to_script(script_lines, chunk_texts)
+
+    print()
+    print("Фраза сценария -> файл:")
+    for m in report.matches:
+        short_line = m.script_line if len(m.script_line) <= 60 else m.script_line[:57] + "..."
+        chunk_name = m.chunk.path.name if m.chunk else "ОТСУТСТВУЕТ — нет озвучки для этой фразы"
+        print(f'  "{short_line}" -> {chunk_name}')
+
+    if report.duplicates:
+        print()
+        print("Дубли (взят самый поздний по времени в имени файла, остальные не используются):")
+        for line, path in report.duplicates:
+            short_line = line if len(line) <= 60 else line[:57] + "..."
+            print(f'  "{short_line}": {path.name}')
+
+    if report.unused_chunks:
+        print()
+        print("Куски без совпадения в сценарии (не будут использованы):")
+        for p in report.unused_chunks:
+            print(f"  {p.name}")
+
+    missing = [m for m in report.matches if m.chunk is None]
+    if missing:
+        print()
+        print(f"Внимание: для {len(missing)} фраз(ы) сценария не нашлось озвучки — они не попадут в voice/full.mp3.")
+
+    matched_paths = [m.chunk.path for m in report.matches if m.chunk]
+    if not matched_paths:
+        print("\nОШИБКА: ни одна фраза сценария не была озвучена, склеивать нечего.")
+        return 1
+
+    if not args.yes:
+        answer = input("\nСклеить voice/full.mp3 по этому сопоставлению? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes", "д", "да"):
+            print("Отменено.")
+            return 1
+
+    out_path = project_dir / "voice" / "full.mp3"
+    try:
+        voice_module.concatenate_chunks(matched_paths, out_path)
+    except voice_module.VoiceError as exc:
+        print(f"ОШИБКА: {exc}")
+        return 1
+
+    print(f"\nГотово: {out_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autoedit",
@@ -252,6 +328,18 @@ def build_parser() -> argparse.ArgumentParser:
     sheet_parser.add_argument("folder", help="Папка с видеофайлами (ищет и во вложенных папках)")
     sheet_parser.add_argument("--out", help="Куда сохранить contact_sheet.jpg (по умолчанию <папка>/output)")
     sheet_parser.set_defaults(func=cmd_sheet)
+
+    voice_parser = subparsers.add_parser("voice", help="Склеить озвучку из кусков по сценарию")
+    voice_parser.add_argument("project", help="Путь к папке проекта (озвучка сохранится в <проект>/voice/full.mp3)")
+    voice_parser.add_argument("--script", required=True, help="Файл сценария (по фразе на строку)")
+    voice_parser.add_argument("--from", dest="from_folder", required=True, help="Папка с отдельными кусками озвучки")
+    voice_parser.add_argument("--yes", action="store_true", help="Не спрашивать подтверждение перед склейкой")
+    voice_parser.add_argument(
+        "--model",
+        default=align_module.DEFAULT_MODEL_SIZE,
+        help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
+    )
+    voice_parser.set_defaults(func=cmd_voice)
 
     return parser
 
