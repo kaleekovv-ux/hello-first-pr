@@ -22,6 +22,8 @@ from .plan import ValidationIssue
 FPS = 30
 PREVIEW_SIZE = (960, 540)
 FINAL_SIZE = (1920, 1080)
+PREVIEW_SIZE_VERTICAL = (540, 960)
+FINAL_SIZE_VERTICAL = (1080, 1920)
 
 
 class RenderError(Exception):
@@ -41,17 +43,22 @@ class RenderMode:
     audio_only: bool = False
 
 
-def preview_mode() -> RenderMode:
-    return RenderMode("preview", *PREVIEW_SIZE, video_preset="veryfast", crf=28, audio_bitrate="192k")
+def preview_mode(vertical: bool = False) -> RenderMode:
+    size = PREVIEW_SIZE_VERTICAL if vertical else PREVIEW_SIZE
+    name = "preview_vertical" if vertical else "preview"
+    return RenderMode(name, *size, video_preset="veryfast", crf=28, audio_bitrate="192k")
 
 
-def final_mode() -> RenderMode:
-    return RenderMode("final", *FINAL_SIZE, video_preset="slow", crf=18, audio_bitrate="320k")
+def final_mode(vertical: bool = False) -> RenderMode:
+    size = FINAL_SIZE_VERTICAL if vertical else FINAL_SIZE
+    name = "final_vertical" if vertical else "final"
+    return RenderMode(name, *size, video_preset="slow", crf=18, audio_bitrate="320k")
 
 
 @dataclass
 class RenderSummary:
     output_path: Path
+    report_path: Path | None = None
     warnings: list[str] = field(default_factory=list)
     issues: list[ValidationIssue] = field(default_factory=list)
     total_duration: float = 0.0
@@ -234,8 +241,9 @@ def render_project(
 
     if mode.audio_only:
         summary.output_path = audio_path or output_dir / "audio_only.wav"
+        summary.report_path = output_dir / f"report_{mode.name}.txt"
         report.write_render_report(
-            output_dir / "report.txt", plan, timeline, summary.issues, summary.warnings,
+            summary.report_path, plan, timeline, summary.issues, summary.warnings,
             total_duration, summary.ai_screen_time, summary.total_screen_time,
         )
         return summary
@@ -275,8 +283,9 @@ def render_project(
         except export.ExportError as exc:
             summary.warnings.append(f"экспорт таймлайна пропущен: {exc}")
 
+    summary.report_path = output_dir / f"report_{mode.name}.txt"
     report.write_render_report(
-        output_dir / "report.txt", plan, timeline, summary.issues, summary.warnings,
+        summary.report_path, plan, timeline, summary.issues, summary.warnings,
         total_duration, summary.ai_screen_time, summary.total_screen_time,
     )
 

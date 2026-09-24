@@ -119,7 +119,7 @@ def cmd_render(args: argparse.Namespace) -> int:
             print(f"  [ОШИБКА] {issue.format()}")
         return 1
 
-    mode = render_module.final_mode() if args.final else render_module.preview_mode()
+    mode = render_module.final_mode(args.vertical) if args.final else render_module.preview_mode(args.vertical)
     mode.no_fx = args.check_no_fx
     mode.no_sound = args.check_no_sound
     mode.audio_only = args.check_audio_only
@@ -130,6 +130,8 @@ def cmd_render(args: argparse.Namespace) -> int:
         (False, True, False): "проверка без звука",
         (False, False, True): "проверка только звука",
     }.get((mode.no_fx, mode.no_sound, mode.audio_only), "рендер")
+    if args.vertical and not mode.audio_only:
+        label += ", вертикальный 9:16"
     print(f"Собираю ролик ({label})...")
 
     def progress(message: str) -> None:
@@ -150,7 +152,8 @@ def cmd_render(args: argparse.Namespace) -> int:
 
     print()
     print(f"Готово: {summary.output_path}")
-    print(f"Отчёт: {project_dir / 'output' / 'report.txt'}")
+    if summary.report_path:
+        print(f"Отчёт: {summary.report_path}")
     return 1 if any(i.level == "error" for i in summary.issues) else 0
 
 
@@ -193,6 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser = subparsers.add_parser("render", help="Собрать ролик по плану")
     render_parser.add_argument("project", help="Путь к папке проекта (с plan.json)")
     render_parser.add_argument("--final", action="store_true", help="Финальное качество (1920x1080, медленнее) вместо чернового превью")
+    render_parser.add_argument(
+        "--vertical",
+        action="store_true",
+        help="Вертикальный формат 9:16 (для YouTube Shorts/TikTok/Reels) вместо обычного 16:9 — "
+        "картинка обрезается по центру из тех же кадров плана",
+    )
     render_parser.add_argument("--check-no-fx", action="store_true", help="Без эффектов и графики — держится ли история на кадрах и голосе")
     render_parser.add_argument("--check-no-sound", action="store_true", help="Без звука — понятно ли по картинке")
     render_parser.add_argument("--check-audio-only", action="store_true", help="Только звук — держится ли история на голосе и звуке")

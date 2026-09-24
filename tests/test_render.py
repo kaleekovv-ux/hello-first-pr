@@ -25,7 +25,26 @@ class RenderProjectIntegrationTests(unittest.TestCase):
         summary = render_project(self.project_dir, self.plan, preview_mode())
         self.assertTrue(summary.output_path.is_file())
         self.assertAlmostEqual(summary.total_duration, 12.0, delta=0.01)
-        self.assertTrue((self.project_dir / "output" / "report.txt").is_file())
+        self.assertIsNotNone(summary.report_path)
+        self.assertTrue(summary.report_path.is_file())
+
+    def test_vertical_mode_produces_9x16_output_alongside_horizontal(self) -> None:
+        import subprocess
+
+        horizontal_summary = render_project(self.project_dir, self.plan, preview_mode())
+        vertical_summary = render_project(self.project_dir, self.plan, preview_mode(vertical=True))
+
+        self.assertNotEqual(horizontal_summary.output_path, vertical_summary.output_path)
+        self.assertTrue(horizontal_summary.output_path.is_file())
+        self.assertTrue(vertical_summary.output_path.is_file())
+
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(vertical_summary.output_path)],
+            capture_output=True, text=True, check=True,
+        )
+        width, height = (int(v) for v in result.stdout.strip().split(",")[:2])
+        self.assertLess(width, height)
+        self.assertEqual((width, height), (540, 960))
 
     def test_audio_only_mode_produces_no_video_file(self) -> None:
         mode = preview_mode()
