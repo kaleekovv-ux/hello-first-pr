@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import opentimelineio as otio
+try:
+    import opentimelineio as otio
+except ImportError:  # pragma: no cover - зависит от установленных extras
+    otio = None  # type: ignore[assignment]
 
 from .align import TimedShot
 from .video import probe_duration
@@ -22,9 +25,20 @@ class ExportError(Exception):
     """Не удалось экспортировать таймлайн."""
 
 
+def _require_otio() -> None:
+    if otio is None:
+        raise ExportError(
+            "Библиотека opentimelineio не установлена — экспорт таймлайна пропущен "
+            "(сам ролик это не затрагивает). Чтобы включить экспорт для DaVinci Resolve, "
+            "установите: pip install autoedit[export] "
+            "(на некоторых системах для этого нужен установленный компилятор C++)."
+        )
+
+
 def build_otio_timeline(
     project_title: str, timeline: list[TimedShot], project_dir: Path, fps: float = DEFAULT_FPS
 ) -> otio.schema.Timeline:
+    _require_otio()
     otio_timeline = otio.schema.Timeline(name=project_title)
     track = otio.schema.Track(name="AutoEdit")
     otio_timeline.tracks.append(track)

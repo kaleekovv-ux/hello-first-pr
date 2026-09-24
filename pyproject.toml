@@ -9,6 +9,10 @@ description = "Черновой автомонтаж документальны�
 requires-python = ">=3.11"
 dependencies = [
     "faster-whisper>=1.0",
+]
+
+[project.optional-dependencies]
+export = [
     "opentimelineio>=0.16",
     "otio-fcpx-xml-adapter>=1.0",
 ]
