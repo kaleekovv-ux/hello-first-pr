@@ -7,6 +7,10 @@ name = "autoedit"
 version = "0.1.0"
 description = "Черновой автомонтаж документальных YouTube-роликов по монтажному плану"
 requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.0",
+    "opentimelineio>=0.16",
+]
 
 [project.scripts]
 autoedit = "autoedit.cli:main"
