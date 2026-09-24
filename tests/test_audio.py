@@ -21,6 +21,55 @@ def _make_tone(path: Path, duration: float = 3.0) -> None:
     )
 
 
+class ParseLoudnormJsonTests(unittest.TestCase):
+    def test_parses_json_when_nothing_follows_it(self) -> None:
+        stderr = (
+            '[Parsed_loudnorm_0 @ 0x0]\n'
+            '{\n'
+            '\t"input_i" : "-23.00",\n'
+            '\t"input_tp" : "-2.00",\n'
+            '\t"input_lra" : "1.00",\n'
+            '\t"input_thresh" : "-33.00",\n'
+            '\t"output_i" : "-14.00",\n'
+            '\t"output_tp" : "-1.00",\n'
+            '\t"output_lra" : "1.00",\n'
+            '\t"output_thresh" : "-24.00",\n'
+            '\t"normalization_type" : "dynamic",\n'
+            '\t"target_offset" : "0.00"\n'
+            '}\n'
+        )
+        result = audio._parse_loudnorm_json(stderr, "тест")
+        self.assertEqual(result["input_i"], "-23.00")
+
+    def test_parses_json_when_ffmpeg_prints_trailing_stats_after_it(self) -> None:
+        # Реальный случай: на некоторых сборках FFmpeg после JSON-отчёта
+        # loudnorm в stderr идёт ещё итоговая строка статистики муксинга —
+        # старый парсер (json.loads до конца строки) падал на этом с
+        # "Extra data".
+        stderr = (
+            '{\n'
+            '\t"input_i" : "-23.00",\n'
+            '\t"input_tp" : "-2.00",\n'
+            '\t"input_lra" : "1.00",\n'
+            '\t"input_thresh" : "-33.00",\n'
+            '\t"output_i" : "-14.00",\n'
+            '\t"output_tp" : "-1.00",\n'
+            '\t"output_lra" : "1.00",\n'
+            '\t"output_thresh" : "-24.00",\n'
+            '\t"normalization_type" : "dynamic",\n'
+            '\t"target_offset" : "0.00"\n'
+            '}\n'
+            'size=N/A time=00:00:12.34 bitrate=N/A speed=45.2x\n'
+            'video:0kB audio:100kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: unknown\n'
+        )
+        result = audio._parse_loudnorm_json(stderr, "тест")
+        self.assertEqual(result["output_i"], "-14.00")
+
+    def test_no_json_object_raises_audio_error(self) -> None:
+        with self.assertRaises(audio.AudioError):
+            audio._parse_loudnorm_json("нет никакого json здесь", "тест")
+
+
 @unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg не установлен в этом окружении")
 class RenderAudioIntegrationTests(unittest.TestCase):
     def test_full_pipeline_produces_correct_duration(self) -> None:

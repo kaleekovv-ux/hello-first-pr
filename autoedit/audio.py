@@ -71,7 +71,11 @@ def _parse_loudnorm_json(stderr: str, step_name: str) -> dict[str, Any]:
     if start == -1:
         raise AudioError(f"Не удалось прочитать результат измерения громкости ({step_name})")
     try:
-        return json.loads(stderr[start:])
+        # raw_decode, а не loads: после JSON-отчёта в stderr на некоторых
+        # сборках FFmpeg идёт ещё текст (итоговая статистика муксинга) —
+        # loads падает на нём с "Extra data", raw_decode просто
+        # останавливается на конце самого объекта и игнорирует хвост.
+        return json.JSONDecoder().raw_decode(stderr[start:])[0]
     except json.JSONDecodeError as exc:
         raise AudioError(f"Не удалось разобрать результат измерения громкости ({step_name}): {exc}") from exc
 
