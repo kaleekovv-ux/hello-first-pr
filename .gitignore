@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Демо- и рабочие проекты AutoEdit (создаются локально, не для репозитория)
+autoedit_demo_project/
+*/output/

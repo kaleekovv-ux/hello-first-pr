@@ -1,0 +1,107 @@
+"""Экспорт собранного таймлайна в OTIO/FCPXML — для доработки в
+DaVinci Resolve (он бесплатный и открыто читает оба формата).
+
+CapCut использует закрытый формат проектов — писать под него ничего не
+пытаемся, это стоит делать вручную, пересобирая ролик в CapCut по
+report.txt и получившемуся видео как референсу.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+try:
+    import opentimelineio as otio
+except ImportError:  # pragma: no cover - зависит от установленных extras
+    otio = None  # type: ignore[assignment]
+
+from .align import TimedShot
+from .video import probe_duration
+
+DEFAULT_FPS = 30.0
+
+
+class ExportError(Exception):
+    """Не удалось экспортировать таймлайн."""
+
+
+def _require_otio() -> None:
+    if otio is None:
+        raise ExportError(
+            "Библиотека opentimelineio не установлена — экспорт таймлайна пропущен "
+            "(сам ролик это не затрагивает). Чтобы включить экспорт для DaVinci Resolve, "
+            "установите: pip install autoedit[export] "
+            "(на некоторых системах для этого нужен установленный компилятор C++)."
+        )
+
+
+def build_otio_timeline(
+    project_title: str, timeline: list[TimedShot], project_dir: Path, fps: float = DEFAULT_FPS
+) -> otio.schema.Timeline:
+    _require_otio()
+    otio_timeline = otio.schema.Timeline(name=project_title)
+    track = otio.schema.Track(name="AutoEdit")
+    otio_timeline.tracks.append(track)
+
+    cursor = 0.0
+    for index, timed in enumerate(timeline):
+        shot = timed.shot
+        asset_path = (project_dir / shot["asset"]).resolve()
+        source_start = float(shot.get("source_start", 0.0) or 0.0)
+
+        # Как в render._layout_video: пустота до кадра — Gap, кадр не
+        # заходит на следующий — чтобы склейки в DaVinci стояли на словах.
+        gap = timed.start - cursor
+        if gap > 0.02:
+            track.append(
+                otio.schema.Gap(
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(0, fps),
+                        duration=otio.opentime.RationalTime(round(gap * fps), fps),
+                    )
+                )
+            )
+        duration = timed.duration
+        if index + 1 < len(timeline):
+            duration = min(duration, timeline[index + 1].start - timed.start)
+        cursor = timed.start + duration
+
+        duration_rt = otio.opentime.RationalTime(round(duration * fps), fps)
+        source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(round(source_start * fps), fps),
+            duration=duration_rt,
+        )
+
+        media_reference = otio.schema.ExternalReference(target_url=asset_path.as_uri())
+        full_duration = probe_duration(asset_path) or (source_start + duration)
+        media_reference.available_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, fps),
+            duration=otio.opentime.RationalTime(round(full_duration * fps), fps),
+        )
+
+        clip = otio.schema.Clip(
+            name=str(shot.get("id", asset_path.stem)),
+            media_reference=media_reference,
+            source_range=source_range,
+        )
+        if shot.get("why"):
+            clip.metadata["autoedit_why"] = shot["why"]
+        track.append(clip)
+
+    return otio_timeline
+
+
+def export_timeline(
+    project_title: str,
+    timeline: list[TimedShot],
+    project_dir: Path,
+    out_path: Path,
+    fps: float = DEFAULT_FPS,
+) -> None:
+    """Пишет .otio или .fcpxml — формат определяется по расширению out_path."""
+    otio_timeline = build_otio_timeline(project_title, timeline, project_dir, fps)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        otio.adapters.write_to_file(otio_timeline, str(out_path))
+    except Exception as exc:  # noqa: BLE001 — адаптеры OTIO бросают разные типы ошибок
+        raise ExportError(f"Не удалось записать {out_path.name}: {exc}") from exc
