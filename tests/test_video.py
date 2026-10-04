@@ -280,6 +280,10 @@ class BuildTextFiltersTests(unittest.TestCase):
                     y_values.add(part)
         self.assertGreaterEqual(len(y_values), 2)
 
+    def test_explicit_newline_decides_where_the_line_breaks(self) -> None:
+        font = video.find_bold_font()
+        self.assertEqual(video._wrap_text_to_lines("Худи оверсайз\nразмер M", font, 96, 2000), ["Худи оверсайз", "размер M"])
+
     def test_fade_in_out_alpha_expression_present(self) -> None:
         filters, _warn = video.build_text_filters("HI", None, 1920, 1080, 3.0)
         self.assertIn(f"alpha='if(lt(t,{video.TEXT_FADE_IN})", filters[0])

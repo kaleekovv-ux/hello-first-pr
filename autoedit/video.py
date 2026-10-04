@@ -202,6 +202,9 @@ class TextSegment:
 def _wrap_text_to_lines(text: str, font_path: str, font_size: int, max_width: float) -> list[str]:
     from PIL import ImageFont
 
+    if "\n" in text:  # явный перенос автора текста важнее автоматического
+        return [line.strip() for line in text.split("\n") if line.strip()][:2]
+
     font = ImageFont.truetype(font_path, font_size)
     words = text.split()
     if not words:
@@ -295,6 +298,8 @@ def build_text_filters(
         block_top = height * 0.08
     elif position == "bottom":
         block_top = height * 0.82 - block_height
+    elif position == "lower":  # ниже центра, но выше подписи и кнопок Instagram Reels
+        block_top = height * 0.70 - block_height
     else:  # center
         block_top = (height - block_height) / 2
 

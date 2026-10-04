@@ -18,6 +18,7 @@
 - `video.py` — рендер кадра FFmpeg-фильтрами: motion, fit (cover/contain/blur_fill), текст (PIL для замера ширины), look, оверлеи.
 - `audio.py` — голос, музыка с sidechain-приглушением, sfx, двухпроходный loudnorm (−14 LUFS).
 - `render.py` — сборка целиком, кэш кадров по хэшу, режимы (preview/final/vertical/debug/check-*). `_layout_video` держит картинку синхронной с таймлайном (чёрные вставки, запас под crossfade).
+- `shop.py` — второй проект пользователя: Instagram-магазин одежды (вещи с европейских сейлов → Украина). `autoedit shop <папка>`: из фото/видео + `item.txt` делает Stories (PIL), Reels 1080×1920 (через render_shot/_layout_video) и подпись. Надписи держать вне зон интерфейса Instagram. Инструкция — `МАГАЗИН_ИНСТРУКЦИЯ.txt`. Мониторинг сайтов и калькулятор цены отложены по просьбе пользователя; сайты Zalando/About You/BestSecret из облака недоступны.
 - `report.py` — `report*.txt`; `voice.py` — склейка кусков озвучки по сценарию; `sheet.py` — лист миниатюр; `gui.py` — окно tkinter.
 
 ## Команды разработки

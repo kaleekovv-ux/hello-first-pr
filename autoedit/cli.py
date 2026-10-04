@@ -18,6 +18,8 @@ from . import plan as plan_module
 from . import render as render_module
 from . import report as report_module
 from . import sheet as sheet_module
+from . import shop as shop_module
+from . import video
 from . import voice as voice_module
 
 
@@ -370,6 +372,38 @@ def cmd_draft(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_shop(args: argparse.Namespace) -> int:
+    folder = Path(args.folder).resolve()
+    if not env_module.check_environment().ffmpeg_ok:
+        print(colorlog.err("Не найден FFmpeg."))
+        print(env_module.ffmpeg_install_hint())
+        return 1
+    if not folder.is_dir():
+        print(colorlog.err(f"Папка не найдена: {folder}"))
+        return 1
+
+    items = shop_module.find_item_folders(folder)
+    if not items:
+        print(colorlog.err(f"В {folder} нет item.txt — ни сама папка, ни вложенные не похожи на папку вещи."))
+        return 1
+
+    failed = 0
+    for item_folder in items:
+        print(colorlog.bold(f"\n{item_folder.name}"))
+        try:
+            outputs = shop_module.build_item_content(item_folder, args.nick or "", lambda m: print(f"  {m}"))
+        except (shop_module.ShopError, video.VideoError, OSError) as exc:
+            print(colorlog.err(f"  ОШИБКА: {exc}"))
+            failed += 1
+            continue
+        print(colorlog.ok(f"  Готово: {len(outputs)} файлов в {item_folder / shop_module.OUTPUT_DIR_NAME}"))
+
+    print()
+    summary = f"Вещей обработано: {len(items) - failed} из {len(items)}."
+    print(colorlog.err(summary) if failed else colorlog.ok(summary))
+    return 1 if failed else 0
+
+
 def cmd_gui(_args: argparse.Namespace) -> int:
     from . import gui as gui_module
 
@@ -590,6 +624,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
     )
     draft_parser.set_defaults(func=cmd_draft)
+
+    shop_parser = subparsers.add_parser(
+        "shop", help="Instagram-магазин: Stories, Reels и подпись из папки вещи (фото/видео + item.txt)"
+    )
+    shop_parser.add_argument("folder", help="Папка вещи или папка со многими папками вещей")
+    shop_parser.add_argument("--nick", help="Ник магазина для надписей, например @my_shop (можно указать в item.txt)")
+    shop_parser.set_defaults(func=cmd_shop)
 
     gui_parser = subparsers.add_parser("gui", help="Открыть простое графическое окно (необязательно)")
     gui_parser.set_defaults(func=cmd_gui)
