@@ -49,6 +49,16 @@ class ExportTimelineTests(unittest.TestCase):
         self.assertTrue(out_path.is_file())
         self.assertIn("S1", out_path.read_text(encoding="utf-8"))
 
+    def test_gap_before_shot_is_kept_so_cuts_stay_on_their_words(self) -> None:
+        timeline = [
+            TimedShot(shot={"id": "S1", "asset": "assets/clip.mp4"}, start=1.0, duration=2.0),
+            TimedShot(shot={"id": "S2", "asset": "assets/clip.mp4"}, start=3.0, duration=2.0),
+        ]
+        otio_timeline = export.build_otio_timeline("Test", timeline, self.project_dir, fps=30)
+        track = otio_timeline.tracks[0]
+        s2_start = track.range_of_child_at_index(2).start_time.to_seconds()
+        self.assertAlmostEqual(s2_start, 3.0, places=2)
+
     def test_fcpxml_export_creates_file(self) -> None:
         out_path = self.project_dir / "timeline.fcpxml"
         export_timeline("Test", self.timeline, self.project_dir, out_path)

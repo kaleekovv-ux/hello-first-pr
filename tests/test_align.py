@@ -121,6 +121,47 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertAlmostEqual(timeline[0].duration, 2.0)
 
 
+class JLCutTests(unittest.TestCase):
+    def _plan(self, second_shot_extra: dict) -> dict:
+        return {
+            "shots": [
+                {"id": "H01", "anchor": "Imagine leaving home"},
+                {"id": "H02", "anchor": "fourteen months later", **second_shot_extra},
+                {"id": "H03", "anchor": "they accuse you"},
+            ]
+        }
+
+    def test_audio_lead_moves_picture_cut_later_but_keeps_audio_start(self) -> None:
+        timeline, issues = build_timeline(self._plan({"audio_lead": 0.5}), SAMPLE_WORDS)
+        self.assertEqual(issues, [])
+        self.assertAlmostEqual(timeline[1].start, 3.5)
+        self.assertAlmostEqual(timeline[1].audio_start, 3.0)
+        self.assertAlmostEqual(timeline[0].duration, 3.5)
+
+    def test_audio_lag_moves_picture_cut_earlier(self) -> None:
+        timeline, issues = build_timeline(self._plan({"audio_lag": 0.7}), SAMPLE_WORDS)
+        self.assertEqual(issues, [])
+        self.assertAlmostEqual(timeline[1].start, 2.3)
+        self.assertAlmostEqual(timeline[1].audio_start, 3.0)
+
+    def test_shift_that_swallows_a_shot_is_an_error(self) -> None:
+        timeline, issues = build_timeline(self._plan({"audio_lead": 2.9}), SAMPLE_WORDS)
+        self.assertTrue(any(i.shot_id == "H02" and "audio_lead/audio_lag" in i.message for i in issues))
+
+    def test_first_shot_is_stretched_to_zero_when_voice_starts_later(self) -> None:
+        plan = {"shots": [{"id": "H02", "anchor": "fourteen months later"}, {"id": "H03", "anchor": "they accuse you"}]}
+        timeline, issues = build_timeline(plan, SAMPLE_WORDS)
+        self.assertEqual(issues, [])
+        self.assertAlmostEqual(timeline[0].start, 0.0)
+        self.assertAlmostEqual(timeline[0].duration, 6.0)
+        self.assertAlmostEqual(timeline[0].audio_start, 3.0)
+
+    def test_first_shot_with_audio_lead_keeps_black_screen_before_it(self) -> None:
+        plan = {"shots": [{"id": "H01", "anchor": "Imagine leaving home", "audio_lead": 1.0}]}
+        timeline, _issues = build_timeline(plan, SAMPLE_WORDS)
+        self.assertAlmostEqual(timeline[0].start, 1.0)
+
+
 class LoadOrTranscribeCacheTests(unittest.TestCase):
     def test_uses_cache_when_fingerprint_matches(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -21,6 +21,7 @@ from .plan import ValidationIssue
 
 DEFAULT_MODEL_SIZE = "small"
 ANCHOR_MATCH_THRESHOLD = 0.6
+MIN_SHIFTED_SHOT_SECONDS = 0.3
 PAUSE_GAP_SECONDS = 0.5
 SUBTITLE_MAX_CHARS_PER_LINE = 42
 SUBTITLE_MAX_LINES = 2
@@ -49,8 +50,16 @@ class AnchorMatch:
 @dataclass
 class TimedShot:
     shot: dict[str, Any]
-    start: float
+    start: float  # когда появляется картинка
     duration: float
+    # Когда звучит anchor (или явный start). Отличается от start, если у
+    # кадра задан audio_lead/audio_lag (J-cut/L-cut). Звуковые события
+    # кадра (sfx, silence_before) привязаны к нему, а не к картинке.
+    audio_start: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.audio_start is None:
+            self.audio_start = self.start
 
 
 def _normalize(text: str) -> str:
@@ -328,19 +337,38 @@ def build_timeline(
 
     resolved.sort(key=lambda pair: pair[1])
 
+    # J-cut (audio_lead): фраза начинает звучать раньше, картинка меняется
+    # позже на audio_lead сек. L-cut (audio_lag): картинка меняется раньше
+    # фразы на audio_lag сек. Сдвигается только склейка картинки.
+    shifts = [float(shot.get("audio_lead") or 0) - float(shot.get("audio_lag") or 0) for shot, _ in resolved]
+    picture_starts = [max(start + shift, 0.0) for (_, start), shift in zip(resolved, shifts)]
+
     timed: list[TimedShot] = []
-    for index, (shot, start) in enumerate(resolved):
+    for index, (shot, audio_start) in enumerate(resolved):
+        start = picture_starts[index]
         explicit_duration = shot.get("duration")
         if explicit_duration is not None:
             duration = float(explicit_duration)
         elif index + 1 < len(resolved):
-            duration = resolved[index + 1][1] - start
+            duration = picture_starts[index + 1] - start
         elif words:
             duration = max(words[-1].end - start, 0.1)
         else:
             duration = 0.1
 
-        if duration <= 0:
+        next_shift = shifts[index + 1] if index + 1 < len(resolved) else 0.0
+        shifted = shifts[index] != 0 or next_shift != 0
+        if shifted and duration < MIN_SHIFTED_SHOT_SECONDS:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    shot.get("id", "?"),
+                    f"из-за audio_lead/audio_lag (у этого или следующего кадра) кадр длится всего "
+                    f"{duration:.2f} сек — уменьшите сдвиг",
+                )
+            )
+            duration = max(duration, 0.1)
+        elif duration <= 0:
             issues.append(
                 ValidationIssue(
                     "error",
@@ -351,7 +379,16 @@ def build_timeline(
             )
             duration = 0.1
 
-        timed.append(TimedShot(shot=shot, start=start, duration=duration))
+        timed.append(TimedShot(shot=shot, start=start, duration=duration, audio_start=audio_start))
+
+    # Ролик начинается с 0 сек, а первая фраза озвучки — обычно чуть
+    # позже. Первый кадр растягиваем к началу, иначе до него была бы
+    # пустота. Исключение — осознанный audio_lead у первого кадра: тогда
+    # голос начинается на чёрном экране (render заполнит его чёрным).
+    if timed and timed[0].start > 0 and not float(timed[0].shot.get("audio_lead") or 0):
+        first = timed[0]
+        first.duration += first.start
+        first.start = 0.0
 
     return timed, issues
 

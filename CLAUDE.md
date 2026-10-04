@@ -11,12 +11,13 @@
 Программа не принимает творческих решений: всё (кадры, склейки, тишина, звук) задаётся в `plan.json`, программа исполняет и честно пишет о проблемах — по-русски, с подсказкой, что делать. Не добавлять «умного» автоподбора.
 
 ## Карта кода (`autoedit/`)
-- `cli.py` — команды `check`, `render`, `build`, `voice`, `sheet`, `demo`, `gui`; цветной вывод через `colorlog.py`.
+- `cli.py` — команды `check`, `render`, `build`, `draft`, `voice`, `sheet`, `demo`, `gui`; цветной вывод через `colorlog.py`.
+- `draft.py` — черновик `plan_draft.json` по сценарию: кадр на фразу (длинные делятся), anchor дословно из распознанной озвучки и проверен тем же поиском, что у `check`.
 - `plan.py` — схема и валидация `plan.json`.
 - `align.py` — faster-whisper, поиск anchor-фраз (строго вперёд по порядку), таймлайн, `subtitles.srt`.
 - `video.py` — рендер кадра FFmpeg-фильтрами: motion, fit (cover/contain/blur_fill), текст (PIL для замера ширины), look, оверлеи.
 - `audio.py` — голос, музыка с sidechain-приглушением, sfx, двухпроходный loudnorm (−14 LUFS).
-- `render.py` — сборка целиком, кэш кадров по хэшу, режимы (preview/final/vertical/debug/check-*).
+- `render.py` — сборка целиком, кэш кадров по хэшу, режимы (preview/final/vertical/debug/check-*). `_layout_video` держит картинку синхронной с таймлайном (чёрные вставки, запас под crossfade).
 - `report.py` — `report*.txt`; `voice.py` — склейка кусков озвучки по сценарию; `sheet.py` — лист миниатюр; `gui.py` — окно tkinter.
 
 ## Команды разработки
@@ -35,7 +36,9 @@
 - drawtext не учитывает ведущие пробелы — отступ считается вручную.
 - Кэш кадра валиден только если в файле есть видеопоток (`has_video_stream`), не просто существует.
 - Имена файлов результата получают суффиксы режима (`_debug`, `_no_fx`…), чтобы не перезаписывать preview/final.
-- Поля `audio_lead`, `audio_lag`, `handles`, `min_ai_visible_seconds` пока только валидируются — при сборке НЕ используются (J/L-cut не реализованы). Не обещать пользователю их действие.
+- Время картинки в готовом видео обязано совпадать с `TimedShot.start` (иначе склейки уезжают от слов): первый кадр растягивается к 0 сек, пустоты заполняются чёрным, перед crossfade предыдущий кадр рендерится длиннее. Есть тесты `VideoStaysInSyncWithTimelineTests`.
+- J/L-cut: `audio_lead`/`audio_lag` сдвигают только склейку картинки (`TimedShot.start`); sfx и silence_before привязаны к `TimedShot.audio_start`.
+- Поля `handles`, `min_ai_visible_seconds` пока только валидируются — при сборке НЕ используются. Не обещать их действие.
 
 ## Составление plan.json по сценарию
-Использовать навык `montage-plan` (`.claude/skills/montage-plan/SKILL.md`).
+Использовать навык `montage-plan` (`.claude/skills/montage-plan/SKILL.md`, уроки — `lessons.md` там же). Примеры удачных планов пользователя — `examples/`.

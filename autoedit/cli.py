@@ -1,8 +1,9 @@
-"""Командная строка AutoEdit: `autoedit check` и `autoedit demo`."""
+"""Командная строка AutoEdit."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 from . import align as align_module
 from . import colorlog
 from . import demo as demo_module
+from . import draft as draft_module
 from . import env as env_module
 from . import plan as plan_module
 from . import render as render_module
@@ -305,6 +307,69 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 1 if has_errors else 0
 
 
+def _find_voice_files(project_dir: Path, explicit: list[str] | None) -> list[str]:
+    if explicit:
+        return explicit
+    plan_path = project_dir / "plan.json"
+    if plan_path.is_file():
+        try:
+            voice = plan_module.load_plan_file(plan_path).get("voice")
+        except plan_module.PlanError:
+            voice = None
+        if isinstance(voice, list) and voice:
+            return voice
+    voice_dir = project_dir / "voice"
+    if voice_dir.is_dir():
+        return [
+            p.relative_to(project_dir).as_posix()
+            for p in sorted(voice_dir.iterdir())
+            if p.is_file() and p.suffix.lower() in voice_module.AUDIO_SUFFIXES
+        ]
+    return []
+
+
+def cmd_draft(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project).resolve()
+    out_path = project_dir / "plan_draft.json"
+    if out_path.exists() and not args.force:
+        print(colorlog.err(f"Файл {out_path} уже есть — чтобы перезаписать его, добавьте --force."))
+        return 1
+
+    try:
+        script_lines = voice_module.load_script(Path(args.script))
+    except voice_module.VoiceError as exc:
+        print(colorlog.err(f"ОШИБКА: {exc}"))
+        return 1
+
+    voice_files = _find_voice_files(project_dir, args.voice)
+    if not voice_files:
+        print(colorlog.err("Не нашёл озвучку: укажите её через --voice или положите файл в папку voice/ проекта."))
+        return 1
+    missing = [v for v in voice_files if not (project_dir / v).is_file()]
+    if missing:
+        print(colorlog.err(f"Файл озвучки не найден: {', '.join(missing)}"))
+        return 1
+
+    print(f"Фраз в сценарии: {len(script_lines)}. Озвучка: {', '.join(voice_files)}")
+    print("Распознаю озвучку (faster-whisper) — при первом запуске может занять время...")
+    try:
+        words = align_module.load_or_transcribe(project_dir, voice_files, args.model)
+        plan, warnings = draft_module.build_draft_plan(script_lines, words, project_dir.name, voice_files)
+    except (align_module.AlignError, ValueError) as exc:
+        print(colorlog.err(f"ОШИБКА: {exc}"))
+        return 1
+
+    out_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    for w in warnings:
+        print(colorlog.warn(f"[предупреждение] {w}"))
+    print()
+    print(colorlog.ok(f"Черновик готов: {len(plan['shots'])} кадров -> {out_path}"))
+    print('Дальше: для каждого кадра заполните "asset" (какое видео) и "why" (зачем этот кадр),')
+    print("при желании motion/beat/chapter, затем переименуйте файл в plan.json и запустите autoedit check .")
+    return 0
+
+
 def cmd_gui(_args: argparse.Namespace) -> int:
     from . import gui as gui_module
 
@@ -509,6 +574,22 @@ def build_parser() -> argparse.ArgumentParser:
         "текст из сценария (например, с цифрами вроде «438»)",
     )
     build_parser_cmd.set_defaults(func=cmd_build)
+
+    draft_parser = subparsers.add_parser(
+        "draft", help="Черновик plan_draft.json: кадры по фразам сценария с готовыми anchor из озвучки"
+    )
+    draft_parser.add_argument("project", help="Путь к папке проекта")
+    draft_parser.add_argument("--script", required=True, help="Файл сценария (по фразе на строку)")
+    draft_parser.add_argument(
+        "--voice", nargs="+", help="Файлы озвучки относительно папки проекта (по умолчанию — из plan.json или папки voice/)"
+    )
+    draft_parser.add_argument("--force", action="store_true", help="Перезаписать уже существующий plan_draft.json")
+    draft_parser.add_argument(
+        "--model",
+        default=align_module.DEFAULT_MODEL_SIZE,
+        help=f"Размер модели распознавания речи (по умолчанию {align_module.DEFAULT_MODEL_SIZE})",
+    )
+    draft_parser.set_defaults(func=cmd_draft)
 
     gui_parser = subparsers.add_parser("gui", help="Открыть простое графическое окно (необязательно)")
     gui_parser.set_defaults(func=cmd_gui)

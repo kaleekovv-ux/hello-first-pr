@@ -17,6 +17,7 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   fi
 fi
 
-python3 -m pip install --quiet --disable-pip-version-check --root-user-action=ignore -e .
+PIP=(python3 -m pip install --quiet --disable-pip-version-check --root-user-action=ignore)
+"${PIP[@]}" -e ".[export]" || "${PIP[@]}" -e .
 
 echo "Окружение AutoEdit готово: $(ffmpeg -version 2>/dev/null | head -1 || echo 'FFmpeg нет'), $(python3 --version)"

@@ -105,8 +105,55 @@ def _build_debug_label(shot: dict[str, Any], start: float) -> str:
     return "  ".join(parts)
 
 
+GAP_EPSILON = 0.02
+
+
+def _layout_video(
+    timeline: list[align.TimedShot],
+) -> tuple[list[float], list[float], list[tuple[str, float]]]:
+    """Как превратить таймлайн в последовательность клипов, чтобы картинка
+    в готовом ролике шла ровно по времени таймлайна (синхронно с голосом).
+
+    Возвращает (длительность рендера каждого кадра, чёрная пауза перед
+    каждым кадром, переход перед каждым кадром):
+    - пустота в таймлайне (например, голос начинается на чёрном экране из-за
+      audio_lead у первого кадра) заполняется чёрным клипом;
+    - кадр с явной duration, заходящий на следующий, обрезается по нему;
+    - перед crossfade предыдущий кадр рендерится длиннее на длину перехода:
+      xfade «съедает» этот запас, и следующий кадр начинается точно на своём
+      anchor, а не раньше (иначе сдвиг копился бы с каждым переходом).
+    """
+    count = len(timeline)
+    base: list[float] = []
+    gaps_before = [timeline[0].start] + [0.0] * (count - 1)
+    for i, timed in enumerate(timeline):
+        if i + 1 < count:
+            room = timeline[i + 1].start - timed.start
+            duration = min(timed.duration, room)
+            gaps_before[i + 1] = max(room - duration, 0.0)
+        else:
+            duration = timed.duration
+        base.append(duration)
+
+    render_durations = list(base)
+    transitions: list[tuple[str, float]] = []
+    for i, timed in enumerate(timeline):
+        kind = timed.shot.get("transition_in", "cut")
+        transition_duration = float(timed.shot.get("transition_duration") or 0.5)
+        if i == 0 or gaps_before[i] > GAP_EPSILON:
+            transitions.append(("cut", 0.0))
+        elif kind == "crossfade" and transition_duration > 0:
+            transition_duration = min(transition_duration, base[i])
+            render_durations[i - 1] += transition_duration
+            transitions.append(("crossfade", transition_duration))
+        else:
+            transitions.append((kind, transition_duration))
+    return render_durations, gaps_before, transitions
+
+
 def _render_shots(
     timeline: list[align.TimedShot],
+    render_durations: list[float],
     project_dir: Path,
     cache_dir: Path,
     mode: RenderMode,
@@ -118,19 +165,19 @@ def _render_shots(
     cache_hits = 0
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, timed in enumerate(timeline, start=1):
+    for i, (timed, duration) in enumerate(zip(timeline, render_durations), start=1):
         shot = _strip_fx(timed.shot) if mode.no_fx else timed.shot
         debug_label = _build_debug_label(shot, timed.start) if mode.debug else None
         cache_key = _hash_payload(
             {
-                "shot": shot, "duration": round(timed.duration, 3), "w": mode.width, "h": mode.height,
+                "shot": shot, "duration": round(duration, 3), "w": mode.width, "h": mode.height,
                 "fps": FPS, "look": look, "debug_label": debug_label,
             }
         )
         clip_path = cache_dir / f"{shot.get('id', i)}_{cache_key}.mp4"
         if not clip_path.is_file() or not video.has_video_stream(clip_path):
             result = video.render_shot(
-                shot, timed.duration, project_dir, clip_path, mode.width, mode.height, FPS, look, debug_label
+                shot, duration, project_dir, clip_path, mode.width, mode.height, FPS, look, debug_label
             )
             warnings.extend(result.warnings)
             _progress(progress, f"Кадр {i}/{len(timeline)} готов ({shot.get('id', '?')})")
@@ -179,7 +226,7 @@ def _resolve_sfx_cues(timeline: list[align.TimedShot], project_dir: Path) -> lis
             cues.append(
                 audio.SfxCue(
                     asset=project_dir / sfx["asset"],
-                    time=timed.start + float(sfx.get("offset", 0.0)),
+                    time=timed.audio_start + float(sfx.get("offset", 0.0)),
                     volume=float(sfx.get("volume", 1.0)),
                 )
             )
@@ -191,7 +238,7 @@ def _resolve_silence_windows(timeline: list[align.TimedShot]) -> list[tuple[floa
     for timed in timeline:
         silence_before = timed.shot.get("silence_before")
         if silence_before:
-            windows.append((max(timed.start - float(silence_before), 0.0), timed.start))
+            windows.append((max(timed.audio_start - float(silence_before), 0.0), timed.audio_start))
     return windows
 
 
@@ -348,15 +395,27 @@ def render_project(
         look = dict(look)
         look["lut"] = str(project_dir / look["lut"])
 
+    render_durations, gaps_before, shot_transitions = _layout_video(timeline)
+
     _progress(progress, f"Рендерю {len(timeline)} кадров...")
-    clip_paths, shot_warnings, cache_hits = _render_shots(timeline, project_dir, cache_dir, mode, look, progress)
+    shot_clips, shot_warnings, cache_hits = _render_shots(
+        timeline, render_durations, project_dir, cache_dir, mode, look, progress
+    )
     summary.warnings.extend(shot_warnings)
     summary.shots_total = len(timeline)
     summary.shots_from_cache = cache_hits
 
-    transitions: list[tuple[str, float]] = [("cut", 0.0)]
-    for timed in timeline[1:]:
-        transitions.append((timed.shot.get("transition_in", "cut"), float(timed.shot.get("transition_duration") or 0.5)))
+    clip_paths: list[Path] = []
+    transitions: list[tuple[str, float]] = []
+    for i, shot_clip in enumerate(shot_clips):
+        if gaps_before[i] > GAP_EPSILON:
+            gap_path = cache_dir / f"gap_{gaps_before[i]:.3f}_{mode.width}x{mode.height}.mp4"
+            if not gap_path.is_file() or not video.has_video_stream(gap_path):
+                video.render_chapters_video([], gaps_before[i], gap_path, mode.width, mode.height, FPS)
+            clip_paths.append(gap_path)
+            transitions.append(("cut", 0.0))
+        clip_paths.append(shot_clip)
+        transitions.append(shot_transitions[i])
 
     end_screen = plan.get("end_screen")
     if end_screen:

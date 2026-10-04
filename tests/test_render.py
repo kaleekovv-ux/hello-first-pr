@@ -4,8 +4,10 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from autoedit import video
+from autoedit.align import TimedShot
 from autoedit.demo import generate_demo_project
-from autoedit.render import RenderError, RenderMode, _build_debug_label, preview_mode, render_project
+from autoedit.render import RenderError, RenderMode, _build_debug_label, _layout_video, preview_mode, render_project
 
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
@@ -122,6 +124,68 @@ class RenderProjectIntegrationTests(unittest.TestCase):
 
         self.assertLess(silence_db, steady_db - 5, "музыка должна заметно стихать перед D03 (silence_before)")
         self.assertLess(fade_in_db, steady_db - 5, "музыка должна начинаться тише из-за fade_in")
+
+
+class LayoutVideoTests(unittest.TestCase):
+    def test_crossfade_lengthens_previous_shot_so_next_starts_on_its_anchor(self) -> None:
+        timeline = [
+            TimedShot(shot={"id": "A"}, start=0.0, duration=3.0),
+            TimedShot(shot={"id": "B", "transition_in": "crossfade", "transition_duration": 0.5}, start=3.0, duration=2.0),
+        ]
+        durations, gaps, transitions = _layout_video(timeline)
+        self.assertEqual(durations, [3.5, 2.0])
+        self.assertEqual(gaps, [0.0, 0.0])
+        self.assertEqual(transitions[1], ("crossfade", 0.5))
+
+    def test_gap_before_first_shot_and_between_explicit_shots_becomes_black(self) -> None:
+        timeline = [
+            TimedShot(shot={"id": "A"}, start=1.0, duration=2.0),
+            TimedShot(shot={"id": "B", "transition_in": "crossfade"}, start=5.0, duration=2.0),
+        ]
+        durations, gaps, transitions = _layout_video(timeline)
+        self.assertEqual(gaps, [1.0, 2.0])
+        self.assertEqual(durations, [2.0, 2.0])
+        self.assertEqual(transitions[1], ("cut", 0.0))
+
+    def test_shot_overlapping_next_is_cut_at_next_start(self) -> None:
+        timeline = [
+            TimedShot(shot={"id": "A"}, start=0.0, duration=5.0),
+            TimedShot(shot={"id": "B"}, start=3.0, duration=2.0),
+        ]
+        durations, _gaps, _transitions = _layout_video(timeline)
+        self.assertEqual(durations, [3.0, 2.0])
+
+
+@unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg не установлен в этом окружении")
+class VideoStaysInSyncWithTimelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.project_dir = Path(self._tmp.name) / "demo"
+        generate_demo_project(self.project_dir)
+        self.plan = json.loads((self.project_dir / "plan.json").read_text(encoding="utf-8"))
+        self.plan.pop("end_screen")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _assembled_duration(self, summary) -> float:
+        return video.probe_duration(summary.output_path.parent / ".cache" / "preview_video.mp4")
+
+    def test_crossfades_do_not_shorten_the_video(self) -> None:
+        for shot in self.plan["shots"][1:]:
+            shot["transition_in"] = "crossfade"
+            shot["transition_duration"] = 0.5
+        summary = render_project(self.project_dir, self.plan, preview_mode())
+        # Раньше каждый crossfade укорачивал видео на 0.5 сек (3 перехода —
+        # минус 1.5 сек), и склейки уезжали раньше своих слов.
+        self.assertAlmostEqual(self._assembled_duration(summary), summary.total_duration, delta=0.1)
+
+    def test_audio_lead_on_first_shot_starts_on_black_and_keeps_length(self) -> None:
+        self.plan["shots"][0]["audio_lead"] = 1.0
+        summary = render_project(self.project_dir, self.plan, preview_mode())
+        self.assertAlmostEqual(self._assembled_duration(summary), summary.total_duration, delta=0.1)
+        self.assertLess(video.sample_mean_brightness(summary.output_path, 0.3), 10)
+        self.assertGreater(video.sample_mean_brightness(summary.output_path, 2.0), 10)
 
 
 class BuildDebugLabelTests(unittest.TestCase):

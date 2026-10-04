@@ -43,19 +43,37 @@ def build_otio_timeline(
     track = otio.schema.Track(name="AutoEdit")
     otio_timeline.tracks.append(track)
 
-    for timed in timeline:
+    cursor = 0.0
+    for index, timed in enumerate(timeline):
         shot = timed.shot
         asset_path = (project_dir / shot["asset"]).resolve()
         source_start = float(shot.get("source_start", 0.0) or 0.0)
 
-        duration_rt = otio.opentime.RationalTime(round(timed.duration * fps), fps)
+        # Как в render._layout_video: пустота до кадра — Gap, кадр не
+        # заходит на следующий — чтобы склейки в DaVinci стояли на словах.
+        gap = timed.start - cursor
+        if gap > 0.02:
+            track.append(
+                otio.schema.Gap(
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(0, fps),
+                        duration=otio.opentime.RationalTime(round(gap * fps), fps),
+                    )
+                )
+            )
+        duration = timed.duration
+        if index + 1 < len(timeline):
+            duration = min(duration, timeline[index + 1].start - timed.start)
+        cursor = timed.start + duration
+
+        duration_rt = otio.opentime.RationalTime(round(duration * fps), fps)
         source_range = otio.opentime.TimeRange(
             start_time=otio.opentime.RationalTime(round(source_start * fps), fps),
             duration=duration_rt,
         )
 
         media_reference = otio.schema.ExternalReference(target_url=asset_path.as_uri())
-        full_duration = probe_duration(asset_path) or (source_start + timed.duration)
+        full_duration = probe_duration(asset_path) or (source_start + duration)
         media_reference.available_range = otio.opentime.TimeRange(
             start_time=otio.opentime.RationalTime(0, fps),
             duration=otio.opentime.RationalTime(round(full_duration * fps), fps),
